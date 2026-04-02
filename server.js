@@ -24,8 +24,11 @@ const upload = multer({
 
 // ─── Gemini AI extraction ──────────────────────────────────────────────────────
 
-const GEMINI_API_KEY = 'AIzaSyAHrIxt2T-C0IfHSNJNRYv6Wm7bLqYLWfw';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
+if (!GEMINI_API_KEY) {
+  console.warn('⚠️ WARNING: GEMINI_API_KEY is not set in environment variables!');
+}
 const EXTRACTION_PROMPT = `You are a bank statement parser. Analyze this bank statement PDF and extract EVERY transaction.
 
 For each transaction, return:
