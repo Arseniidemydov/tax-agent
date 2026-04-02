@@ -1,0 +1,18 @@
+<svg width="400" height="250" viewBox="0 0 400 250" xmlns="http://www.w3.org/2000/svg">
+  <!-- Blue circle -->
+  <circle cx="200" cy="100" r="90" fill="none" stroke="#174574" stroke-width="2.5" />
+  
+  <!-- Handwritten looking line mimicking the logo -->
+  <path d="M 20 140 
+           C 80 100, 120 130, 140 130 
+           C 150 70, 180 10, 140 160 
+           C 160 120, 180 120, 190 150 
+           C 210 120, 220 130, 230 150 
+           C 240 110, 250 110, 270 140 
+           C 310 140, 350 140, 380 110" 
+        fill="none" stroke="#174574" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" />
+
+  <!-- Wordmarks -->
+  <text x="70" y="230" font-family="Inter, Arial, sans-serif" font-weight="900" font-size="44" fill="#E6252D" letter-spacing="14">TAX</text>
+  <text x="220" y="230" font-family="Inter, Arial, sans-serif" font-weight="900" font-size="44" fill="#174574" letter-spacing="14">PRO</text>
+</svg>

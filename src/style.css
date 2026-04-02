@@ -117,26 +117,11 @@ body {
   margin-bottom: 8px;
 }
 
-.logo-icon {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 48px;
-  height: 48px;
-  border-radius: 14px;
-  background: var(--gradient-primary);
-  color: #fff;
-  box-shadow: 0 4px 20px rgba(79, 143, 255, 0.4);
-}
-
-.logo h1 {
-  font-size: 2rem;
-  font-weight: 800;
-  background: var(--gradient-primary);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-  letter-spacing: -0.5px;
+.main-logo {
+  height: 100px;
+  max-width: 100%;
+  object-fit: contain;
+  filter: drop-shadow(0 4px 12px rgba(0, 0, 0, 0.2));
 }
 
 .tagline {
@@ -667,8 +652,8 @@ body {
     font-size: 1.2rem;
   }
 
-  .logo h1 {
-    font-size: 1.6rem;
+  .main-logo {
+    height: 70px;
   }
 
   .data-table {
