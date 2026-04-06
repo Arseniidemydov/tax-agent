@@ -55,7 +55,7 @@ Example output:
 
 async function extractTransactionsFromPDF(pdfBuffer) {
   const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+  const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
 
   const base64PDF = pdfBuffer.toString('base64');
 
@@ -192,12 +192,10 @@ async function processJob(jobId, files) {
   console.log(`\n📄 [Job ${jobId}] Received ${files.length} PDF file(s) for processing...`);
 
   try {
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      job.currentFile = i + 1;
-      job.progress = Math.round((i / files.length) * 100);
-      
-      console.log(`  ⏳ [Job ${jobId}] Processing [${i + 1}/${files.length}]: ${file.originalname}`);
+    let filesCompleted = 0;
+
+    const promises = files.map(async (file, i) => {
+      console.log(`  ⏳ [Job ${jobId}] Started processing [${i + 1}/${files.length}]: ${file.originalname}`);
 
       try {
         const transactions = await extractTransactionsFromPDF(file.buffer);
@@ -208,11 +206,6 @@ async function processJob(jobId, files) {
           transactionCount: transactions.length,
         });
         console.log(`  ✅ [Job ${jobId}] Extracted ${transactions.length} transactions from ${file.originalname}`);
-        
-        // Safety delay to prevent tripping the strict 5 requests limits on free tier
-        // Waiting 2 seconds between documents.
-        await new Promise(r => setTimeout(r, 2000));
-        
       } catch (err) {
         console.error(`  ❌ [Job ${jobId}] Failed to process ${file.originalname}:`, err.message);
         job.filesProcessed.push({
@@ -220,8 +213,14 @@ async function processJob(jobId, files) {
           status: 'error',
           error: err.message,
         });
+      } finally {
+        filesCompleted++;
+        job.currentFile = filesCompleted;
+        job.progress = Math.round((filesCompleted / files.length) * 100);
       }
-    }
+    });
+
+    await Promise.all(promises);
 
     const aggregated = aggregateTransactions(allTransactions);
     
