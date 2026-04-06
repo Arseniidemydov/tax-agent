@@ -24,36 +24,38 @@ const upload = multer({
 
 // ─── Gemini AI extraction ──────────────────────────────────────────────────────
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyDfU1ic1v5TFsAqY6_zurgBhcth9MvE3sQ';
 
 if (!GEMINI_API_KEY) {
-  console.warn('⚠️ WARNING: GEMINI_API_KEY is not set in environment variables!');
+  console.warn('⚠️ WARNING: GEMINI_API_KEY is not set!');
 }
-const EXTRACTION_PROMPT = `You are a bank statement parser. Analyze this bank statement PDF and extract EVERY transaction.
+const EXTRACTION_PROMPT = `You are an expert tax accountant and bank statement parser. Analyze this bank statement PDF and extract EVERY transaction.
 
 For each transaction, return:
 - date: the transaction date (as shown on statement)
 - description: the transaction description/memo (keep original wording, but normalize: trim whitespace, remove extra spaces)
 - amount: the absolute numeric amount (no currency symbols, no commas — just a number like 1234.56)
 - type: either "deposit" or "deduction"
+- category: Assign the transaction to exactly ONE of the following standard IRS Schedule C categories:
+  [Advertising, Car and truck expenses, Commissions and fees, Contract labor (Subcontractors), Depletion / Depreciation, Employee benefit programs, Insurance, Interest, Legal and professional services, Office expense, Pension and profit-sharing plans, Rent or lease, Repairs and maintenance, Supplies, Taxes and licenses, Travel and meals, Utilities, Wages, Other expenses, Income]
 
 IMPORTANT RULES:
 1. Extract ALL transactions — do not skip any
-2. A deposit is money coming IN (credits, deposits, transfers in, refunds)
-3. A deduction is money going OUT (debits, withdrawals, payments, fees, transfers out)
+2. A deposit is money coming IN. Use category "Income" or "Other expenses" (if refund).
+3. A deduction is money going OUT. Choose the most accurate category from the list above.
 4. If a transaction description appears multiple times, keep the EXACT same description text for all occurrences so they can be grouped later
-5. Normalize descriptions: e.g. "AMAZON.COM*1A2B3C" and "AMAZON.COM*4D5E6F" should both be "AMAZON.COM" (strip unique reference numbers)
-6. Return ONLY a valid JSON array, no markdown fences, no extra text
+5. Normalize descriptions (strip unique reference numbers)
+6. Return ONLY a valid JSON array, no formatting marks
 
 Example output:
 [
-  {"date": "01/15/2025", "description": "EMPLOYER INC DIRECT DEPOSIT", "amount": 3500.00, "type": "deposit"},
-  {"date": "01/16/2025", "description": "AMAZON.COM", "amount": 45.99, "type": "deduction"}
+  {"date": "01/15/2025", "description": "EMPLOYER INC DIRECT DEPOSIT", "amount": 3500.00, "type": "deposit", "category": "Income"},
+  {"date": "01/16/2025", "description": "AMAZON.COM", "amount": 45.99, "type": "deduction", "category": "Office expense"}
 ]`;
 
 async function extractTransactionsFromPDF(pdfBuffer) {
   const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-  const model = genAI.getGenerativeModel({ model: 'gemini-3.1-pro-preview' });
+  const model = genAI.getGenerativeModel({ model: 'gemini-3.0-flash' });
 
   const base64PDF = pdfBuffer.toString('base64');
 
@@ -85,7 +87,9 @@ async function extractTransactionsFromPDF(pdfBuffer) {
   }
 
   const responseText = result.response.text();
-
+  console.log('--- RAW AI RESPONSE ---');
+  console.log(responseText.substring(0, 500) + '...');
+  
   // Parse JSON from response (handle markdown fences if present)
   let jsonStr = responseText;
   const jsonMatch = responseText.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -96,6 +100,7 @@ async function extractTransactionsFromPDF(pdfBuffer) {
   // Try to find the JSON array
   const arrayMatch = jsonStr.match(/\[[\s\S]*\]/);
   if (!arrayMatch) {
+    console.error('FAILED TO PARSE JSON. RAW TEXT WAS:', responseText);
     throw new Error('Could not parse transaction data from AI response');
   }
 
@@ -113,13 +118,14 @@ function aggregateTransactions(allTransactions) {
     const desc = (tx.description || 'UNKNOWN').trim().toUpperCase();
     const amount = Math.abs(parseFloat(tx.amount) || 0);
     const type = (tx.type || '').toLowerCase();
+    const category = (tx.category || 'Other expenses').trim();
 
     if (type === 'deposit') {
-      if (!deposits[desc]) deposits[desc] = { description: desc, total: 0, count: 0 };
+      if (!deposits[desc]) deposits[desc] = { description: desc, total: 0, count: 0, category: category };
       deposits[desc].total += amount;
       deposits[desc].count += 1;
     } else {
-      if (!deductions[desc]) deductions[desc] = { description: desc, total: 0, count: 0 };
+      if (!deductions[desc]) deductions[desc] = { description: desc, total: 0, count: 0, category: category };
       deductions[desc].total += amount;
       deductions[desc].count += 1;
     }
@@ -186,12 +192,10 @@ async function processJob(jobId, files) {
   console.log(`\n📄 [Job ${jobId}] Received ${files.length} PDF file(s) for processing...`);
 
   try {
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      job.currentFile = i + 1;
-      job.progress = Math.round((i / files.length) * 100);
-      
-      console.log(`  ⏳ [Job ${jobId}] Processing [${i + 1}/${files.length}]: ${file.originalname}`);
+    let filesCompleted = 0;
+
+    const promises = files.map(async (file, i) => {
+      console.log(`  ⏳ [Job ${jobId}] Started processing [${i + 1}/${files.length}]: ${file.originalname}`);
 
       try {
         const transactions = await extractTransactionsFromPDF(file.buffer);
@@ -209,8 +213,14 @@ async function processJob(jobId, files) {
           status: 'error',
           error: err.message,
         });
+      } finally {
+        filesCompleted++;
+        job.currentFile = filesCompleted;
+        job.progress = Math.round((filesCompleted / files.length) * 100);
       }
-    }
+    });
+
+    await Promise.all(promises);
 
     const aggregated = aggregateTransactions(allTransactions);
     

@@ -236,6 +236,7 @@ function showResults(data) {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${idx + 1}</td>
+      <td><span class="category-badge" style="font-size: 0.8rem; background: var(--bg-hover); padding: 2px 6px; border-radius: 4px; color: var(--text-secondary);">${escapeHtml(item.category || 'Other')}</span></td>
       <td>${escapeHtml(item.description)}</td>
       <td>${item.count}</td>
       <td>${formatMoney(item.total)}</td>
@@ -246,6 +247,7 @@ function showResults(data) {
   const depTotalTr = document.createElement('tr');
   depTotalTr.className = 'total-row';
   depTotalTr.innerHTML = `
+    <td></td>
     <td></td>
     <td>TOTAL</td>
     <td>${data.deposits.reduce((s, d) => s + d.count, 0)}</td>
@@ -259,6 +261,7 @@ function showResults(data) {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${idx + 1}</td>
+      <td><span class="category-badge" style="font-size: 0.8rem; background: var(--bg-hover); padding: 2px 6px; border-radius: 4px; color: var(--text-secondary);">${escapeHtml(item.category || 'Other')}</span></td>
       <td>${escapeHtml(item.description)}</td>
       <td>${item.count}</td>
       <td>${formatMoney(item.total)}</td>
@@ -268,6 +271,7 @@ function showResults(data) {
   const dedTotalTr = document.createElement('tr');
   dedTotalTr.className = 'total-row';
   dedTotalTr.innerHTML = `
+    <td></td>
     <td></td>
     <td>TOTAL</td>
     <td>${data.deductions.reduce((s, d) => s + d.count, 0)}</td>
