@@ -24,7 +24,7 @@ const upload = multer({
 
 // ─── Gemini AI extraction ──────────────────────────────────────────────────────
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyDfU1ic1v5TFsAqY6_zurgBhcth9MvE3sQ';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 if (!GEMINI_API_KEY) {
   console.warn('⚠️ WARNING: GEMINI_API_KEY is not set!');
