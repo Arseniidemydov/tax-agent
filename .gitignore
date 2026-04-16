@@ -1,5 +1,9 @@
 node_modules/
 dist/
+data/
 .env
+.env.local
+.env.*
+!.env.example
 .DS_Store
 *.pdf

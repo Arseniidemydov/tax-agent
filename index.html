@@ -33,6 +33,84 @@
         <h2>Upload Bank Statements</h2>
         <p class="card-desc">Drop your PDF bank statements below (up to 20 files, last 12 months)</p>
 
+        <div class="company-picker">
+          <div class="mode-picker-header">
+            <h3 id="company-profile-label">Active Company Profile</h3>
+            <p>Professional rules, chart accounts, and future review answers are saved inside the selected company profile.</p>
+          </div>
+
+          <div class="company-picker-controls">
+            <label class="settings-field">
+              <span>Selected Company</span>
+              <select id="company-select" aria-labelledby="company-profile-label"></select>
+            </label>
+          </div>
+
+          <form id="company-create-form" class="company-create-form">
+            <label class="settings-field company-create-field">
+              <span>Create New Company</span>
+              <input id="company-name-input" type="text" maxlength="120" placeholder="Flo Marketing" />
+            </label>
+            <button id="company-create-btn" class="btn btn-secondary btn-inline" type="submit">
+              <span>Create Company</span>
+            </button>
+          </form>
+        </div>
+
+        <div class="mode-picker">
+          <div class="mode-picker-header">
+            <h3 id="analysis-mode-label">Choose Your Output</h3>
+            <p>Keep the fast grouped summary, or build a more accountant-style professional P&amp;L.</p>
+          </div>
+
+          <div class="mode-grid" role="radiogroup" aria-labelledby="analysis-mode-label">
+            <label class="mode-option">
+              <input type="radio" name="analysis-mode" value="simple" checked />
+              <span class="mode-option-card">
+                <span class="mode-option-tag">Current workflow</span>
+                <span class="mode-option-title">Simple deposit/deduction</span>
+                <span class="mode-option-copy">Grouped deposits and deductions by description, with the same fast summary you already have.</span>
+              </span>
+            </label>
+
+            <label class="mode-option">
+              <input type="radio" name="analysis-mode" value="professional" />
+              <span class="mode-option-card">
+                <span class="mode-option-tag mode-option-tag-pro">New</span>
+                <span class="mode-option-title">Professional P&amp;L</span>
+                <span class="mode-option-copy">Classifies transactions into income, COGS, expenses, and net income for a more professional statement layout.</span>
+              </span>
+            </label>
+          </div>
+
+          <div id="professional-review-settings" class="mode-subpicker" hidden>
+            <div class="mode-picker-header">
+              <h3 id="professional-review-mode-label">Professional Review Style</h3>
+              <p>Choose whether the professional flow can auto-apply only the safest verifier remaps, or should stop for every material or unclear classification.</p>
+            </div>
+
+            <div class="mode-grid mode-grid-secondary" role="radiogroup" aria-labelledby="professional-review-mode-label">
+              <label class="mode-option">
+                <input type="radio" name="professional-review-mode" value="strict" checked />
+                <span class="mode-option-card mode-option-card-secondary">
+                  <span class="mode-option-tag mode-option-tag-pro">Recommended</span>
+                  <span class="mode-option-title">Strict review</span>
+                  <span class="mode-option-copy">Pauses before finalizing the P&amp;L whenever a material or unclear professional classification still needs your confirmation.</span>
+                </span>
+              </label>
+
+              <label class="mode-option">
+                <input type="radio" name="professional-review-mode" value="standard" />
+                <span class="mode-option-card mode-option-card-secondary">
+                  <span class="mode-option-tag">Faster</span>
+                  <span class="mode-option-title">Standard review</span>
+                  <span class="mode-option-copy">Auto-applies saved rules and only the most confident verifier remaps, then asks you about the remaining uncertain items.</span>
+                </span>
+              </label>
+            </div>
+          </div>
+        </div>
+
         <div id="drop-zone" class="drop-zone">
           <div class="drop-zone-content">
             <svg class="drop-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -58,7 +136,7 @@
             <line x1="12" y1="12" x2="12" y2="21"/>
             <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/>
           </svg>
-          <span>Process Statements</span>
+          <span id="upload-btn-label">Process Statements</span>
         </button>
       </div>
     </section>
@@ -67,7 +145,12 @@
     <section id="processing-section" class="section" style="display:none;">
       <div class="card glass-card">
         <h2>Processing Your Statements</h2>
-        <p class="card-desc">AI is analyzing each PDF to extract transactions...</p>
+        <div class="results-header">
+          <div>
+            <span id="processing-mode-pill" class="mode-pill">Simple deposit/deduction</span>
+            <p id="processing-desc" class="card-desc">AI is analyzing each PDF to extract transactions...</p>
+          </div>
+        </div>
         <div id="progress-container" class="progress-container">
           <div class="progress-bar-track">
             <div id="progress-bar" class="progress-bar-fill"></div>
@@ -81,67 +164,356 @@
     <!-- Results Section -->
     <section id="results-section" class="section" style="display:none;">
       <div class="card glass-card">
-        <h2>Analysis Complete</h2>
-
-        <!-- Summary Cards -->
-        <div class="summary-grid">
-          <div class="summary-card summary-deposits">
-            <div class="summary-label">Total Deposits</div>
-            <div id="total-deposits" class="summary-value">$0.00</div>
-          </div>
-          <div class="summary-card summary-deductions">
-            <div class="summary-label">Total Deductions</div>
-            <div id="total-deductions" class="summary-value">$0.00</div>
-          </div>
-          <div class="summary-card summary-net">
-            <div class="summary-label">Net</div>
-            <div id="total-net" class="summary-value">$0.00</div>
-          </div>
-          <div class="summary-card summary-count">
-            <div class="summary-label">Transactions</div>
-            <div id="total-count" class="summary-value">0</div>
+        <div class="results-header">
+          <div>
+            <span id="results-mode-pill" class="mode-pill">Simple deposit/deduction</span>
+            <h2 id="results-title">Analysis Complete</h2>
+            <p id="results-subtitle" class="card-desc">Grouped deposits and deductions by description, ready for export.</p>
           </div>
         </div>
 
-        <!-- Deposits Table -->
-        <div class="table-section">
-          <h3 class="table-title deposits-title">
-            <span class="dot dot-green"></span> Deposits by Description
-          </h3>
-          <div class="table-wrapper">
-            <table id="deposits-table" class="data-table">
-              <thead>
-                <tr>
-                  <th>#</th>
-                  <th>Category</th>
-                  <th>Description</th>
-                  <th>Occurrences</th>
-                  <th>Total Amount</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
+        <div id="review-results-view" style="display:none;">
+          <div id="review-summary-note" class="insight-note">
+            We found a few transactions that need your input before we finalize the professional P&amp;L.
+          </div>
+
+          <div id="review-questions" class="review-question-list"></div>
+
+          <button id="review-submit-btn" class="btn btn-primary">
+            <span>Apply Answers &amp; Build P&amp;L</span>
+          </button>
+        </div>
+
+        <div id="simple-results-view">
+          <!-- Summary Cards -->
+          <div class="summary-grid">
+            <div class="summary-card summary-deposits">
+              <div class="summary-label">Total Deposits</div>
+              <div id="total-deposits" class="summary-value">$0.00</div>
+            </div>
+            <div class="summary-card summary-deductions">
+              <div class="summary-label">Total Deductions</div>
+              <div id="total-deductions" class="summary-value">$0.00</div>
+            </div>
+            <div class="summary-card summary-net">
+              <div class="summary-label">Net</div>
+              <div id="total-net" class="summary-value">$0.00</div>
+            </div>
+            <div class="summary-card summary-count">
+              <div class="summary-label">Transactions</div>
+              <div id="total-count" class="summary-value">0</div>
+            </div>
+          </div>
+
+          <!-- Deposits Table -->
+          <div class="table-section">
+            <h3 class="table-title deposits-title">
+              <span class="dot dot-green"></span> Deposits by Description
+            </h3>
+            <div class="table-wrapper">
+              <table id="deposits-table" class="data-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Category</th>
+                    <th>Description</th>
+                    <th>Occurrences</th>
+                    <th>Total Amount</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Deductions Table -->
+          <div class="table-section">
+            <h3 class="table-title deductions-title">
+              <span class="dot dot-red"></span> Deductions by Description
+            </h3>
+            <div class="table-wrapper">
+              <table id="deductions-table" class="data-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Category</th>
+                    <th>Description</th>
+                    <th>Occurrences</th>
+                    <th>Total Amount</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
           </div>
         </div>
 
-        <!-- Deductions Table -->
-        <div class="table-section">
-          <h3 class="table-title deductions-title">
-            <span class="dot dot-red"></span> Deductions by Description
-          </h3>
-          <div class="table-wrapper">
-            <table id="deductions-table" class="data-table">
-              <thead>
-                <tr>
-                  <th>#</th>
-                  <th>Category</th>
-                  <th>Description</th>
-                  <th>Occurrences</th>
-                  <th>Total Amount</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
+        <div id="professional-results-view" style="display:none;">
+          <!-- Top-level KPI cards -->
+          <div class="summary-grid">
+            <div class="summary-card summary-income">
+              <div class="summary-label">Total Income</div>
+              <div id="pnl-total-income" class="summary-value">$0.00</div>
+            </div>
+            <div class="summary-card summary-gross-profit">
+              <div class="summary-label">Gross Profit</div>
+              <div id="pnl-gross-profit" class="summary-value">$0.00</div>
+            </div>
+            <div class="summary-card summary-expenses">
+              <div class="summary-label">Expenses</div>
+              <div id="pnl-total-expenses" class="summary-value">$0.00</div>
+            </div>
+            <div class="summary-card summary-net-income">
+              <div class="summary-label">Net Income</div>
+              <div id="pnl-net-income" class="summary-value">$0.00</div>
+            </div>
+          </div>
+
+          <!-- Collapsible secondary metrics -->
+          <details class="pnl-details" id="pnl-secondary-metrics">
+            <summary class="pnl-details-summary">
+              <span class="pnl-details-icon">▸</span>
+              More Metrics
+            </summary>
+            <div class="pnl-details-body">
+              <div class="metric-strip">
+                <div class="metric-chip">
+                  <span class="metric-chip-label">COGS</span>
+                  <span id="pnl-total-cogs" class="metric-chip-value">$0.00</span>
+                </div>
+                <div class="metric-chip">
+                  <span class="metric-chip-label">Net Operating Income</span>
+                  <span id="pnl-net-operating-income" class="metric-chip-value">$0.00</span>
+                </div>
+                <div class="metric-chip">
+                  <span class="metric-chip-label">Other Income</span>
+                  <span id="pnl-total-other-income" class="metric-chip-value">$0.00</span>
+                </div>
+                <div class="metric-chip">
+                  <span class="metric-chip-label">Other Expenses</span>
+                  <span id="pnl-total-other-expenses" class="metric-chip-value">$0.00</span>
+                </div>
+              </div>
+              <div id="pnl-review-note" class="insight-note">
+                Excluded from P&amp;L: 0 transfer or balance-sheet-style transactions.
+              </div>
+            </div>
+          </details>
+
+          <!-- Tab navigation -->
+          <nav class="pnl-tabs" role="tablist" aria-label="P&amp;L sections">
+            <button class="pnl-tab active" role="tab" aria-selected="true" data-tab="pnl-tab-statement">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+              P&amp;L Statement
+            </button>
+            <button class="pnl-tab" role="tab" aria-selected="false" data-tab="pnl-tab-quick-reports">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              Quick Reports
+            </button>
+            <button class="pnl-tab" role="tab" aria-selected="false" data-tab="pnl-tab-audit">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+              Audit Trail
+            </button>
+            <button class="pnl-tab" role="tab" aria-selected="false" data-tab="pnl-tab-settings">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15A1.65 1.65 0 0 0 20 13.6a1.65 1.65 0 0 0-.6-1.2l-1-.8a1.65 1.65 0 0 1-.5-1.7l.3-1.3a1.65 1.65 0 0 0-.4-1.4 1.65 1.65 0 0 0-1.3-.6h-1.3a1.65 1.65 0 0 1-1.5-.9l-.5-1.2A1.65 1.65 0 0 0 12 2a1.65 1.65 0 0 0-1.2.5l-.8 1a1.65 1.65 0 0 1-1.7.5L7 3.7a1.65 1.65 0 0 0-1.4.4 1.65 1.65 0 0 0-.6 1.3v1.3a1.65 1.65 0 0 1-.9 1.5l-1.2.5A1.65 1.65 0 0 0 2 12c0 .5.2 1 .5 1.2l1 .8a1.65 1.65 0 0 1 .5 1.7l-.3 1.3a1.65 1.65 0 0 0 .4 1.4 1.65 1.65 0 0 0 1.3.6h1.3a1.65 1.65 0 0 1 1.5.9l.5 1.2A1.65 1.65 0 0 0 12 22c.5 0 1-.2 1.2-.5l.8-1a1.65 1.65 0 0 1 1.7-.5l1.3.3a1.65 1.65 0 0 0 1.4-.4 1.65 1.65 0 0 0 .6-1.3v-1.3a1.65 1.65 0 0 1 .9-1.5z"/></svg>
+              Rules &amp; Chart
+            </button>
+          </nav>
+
+          <!-- Tab: P&L Statement -->
+          <div class="pnl-tab-content active" id="pnl-tab-statement" role="tabpanel">
+            <div class="table-section">
+              <h3 class="table-title professional-title">
+                <span class="dot dot-blue"></span> Professional P&amp;L Statement
+              </h3>
+              <div class="table-wrapper">
+                <table id="pnl-table" class="statement-table">
+                  <thead>
+                    <tr>
+                      <th>Account</th>
+                      <th>Total</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <!-- Tab: Quick Reports -->
+          <div class="pnl-tab-content" id="pnl-tab-quick-reports" role="tabpanel">
+            <div id="pnl-quick-reports-panel" class="quick-reports-panel">
+              <div class="quick-report-toolbar">
+                <label for="quick-report-select" class="quick-report-label">Choose a report</label>
+                <select id="quick-report-select" class="quick-report-select"></select>
+                <button id="quick-report-download-btn" class="btn btn-secondary btn-inline quick-report-download-btn" type="button">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="7 10 12 15 17 10"/>
+                    <line x1="12" y1="15" x2="12" y2="3"/>
+                  </svg>
+                  <span>Download Quick Report PDF</span>
+                </button>
+              </div>
+
+              <div id="quick-report-summary" class="quick-report-summary"></div>
+
+              <div class="table-wrapper">
+                <table class="statement-table quick-report-table">
+                  <thead>
+                    <tr>
+                      <th>Date</th>
+                      <th>Type</th>
+                      <th>Name</th>
+                      <th>Memo / Description</th>
+                      <th>Distribution Account</th>
+                      <th>Source Account</th>
+                      <th>Amount</th>
+                      <th>Balance</th>
+                    </tr>
+                  </thead>
+                  <tbody id="quick-report-table-body"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <!-- Tab: Audit Trail -->
+          <div class="pnl-tab-content" id="pnl-tab-audit" role="tabpanel">
+            <div id="pnl-audit-panel" class="audit-panel">
+              <div class="audit-section">
+                <div class="audit-header">
+                  <h3 class="audit-title">How This P&amp;L Was Built</h3>
+                  <p class="audit-copy">
+                    A transparent breakdown of the rules, formulas, and transfer decisions used to build the professional statement.
+                  </p>
+                </div>
+                <div id="pnl-audit-stats" class="audit-stats-grid"></div>
+              </div>
+
+              <div class="audit-columns">
+                <div class="audit-section audit-column">
+                  <h4 class="audit-subtitle">Logic Steps</h4>
+                  <div id="pnl-audit-steps" class="audit-step-list"></div>
+                </div>
+
+                <div class="audit-section audit-column">
+                  <h4 class="audit-subtitle">Formula Breakdown</h4>
+                  <div id="pnl-audit-formulas" class="audit-formula-list"></div>
+                </div>
+              </div>
+
+              <div class="audit-section">
+                <h4 class="audit-subtitle">Statement Coverage &amp; Completeness</h4>
+                <div id="pnl-audit-coverage" class="audit-coverage-list"></div>
+              </div>
+
+              <div class="audit-section">
+                <h4 class="audit-subtitle">Transfer Clusters</h4>
+                <div id="pnl-audit-transfers" class="audit-cluster-list"></div>
+              </div>
+
+              <div id="pnl-audit-review-section" class="audit-section" style="display:none;">
+                <h4 class="audit-subtitle">Review Decisions Applied</h4>
+                <div id="pnl-audit-review-decisions" class="audit-decision-list"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Tab: Rules & Chart -->
+          <div class="pnl-tab-content" id="pnl-tab-settings" role="tabpanel">
+            <div class="settings-panel">
+              <div class="settings-toolbar">
+                <div>
+                  <h3 class="audit-title">Rules &amp; Chart Manager</h3>
+                  <p class="audit-copy">Manage the professional chart of accounts and the saved review rules that future runs can reuse automatically.</p>
+                </div>
+                <button id="settings-refresh-btn" class="btn btn-secondary btn-inline" type="button">
+                  <span>Refresh Settings</span>
+                </button>
+              </div>
+
+              <div id="settings-company-note" class="settings-company-note">Active company: loading...</div>
+              <div id="settings-status" class="settings-status">Loading professional settings...</div>
+
+              <div class="settings-summary-grid">
+                <div class="audit-stat-card">
+                  <div class="audit-stat-label">Active Chart Accounts</div>
+                  <div id="settings-chart-count" class="audit-stat-value">0</div>
+                </div>
+                <div class="audit-stat-card">
+                  <div class="audit-stat-label">Custom Accounts</div>
+                  <div id="settings-custom-chart-count" class="audit-stat-value">0</div>
+                </div>
+                <div class="audit-stat-card">
+                  <div class="audit-stat-label">Active Review Rules</div>
+                  <div id="settings-rule-count" class="audit-stat-value">0</div>
+                </div>
+                <div class="audit-stat-card">
+                  <div class="audit-stat-label">Disabled Rules</div>
+                  <div id="settings-disabled-rule-count" class="audit-stat-value">0</div>
+                </div>
+              </div>
+
+              <div class="settings-columns">
+                <section class="audit-section settings-column">
+                  <div class="settings-section-head">
+                    <div>
+                      <h4 class="audit-subtitle">Chart of Accounts</h4>
+                      <p class="settings-copy">Add custom professional accounts or disable verifier choices you do not want suggested.</p>
+                    </div>
+                  </div>
+
+                  <form id="chart-account-form" class="settings-form">
+                    <div class="settings-form-grid">
+                      <label class="settings-field">
+                        <span>Section</span>
+                        <select id="chart-account-section" required>
+                          <option value="Income">Income</option>
+                          <option value="Cost of Goods Sold">Cost of Goods Sold</option>
+                          <option value="Expenses" selected>Expenses</option>
+                          <option value="Other Income">Other Income</option>
+                          <option value="Other Expenses">Other Expenses</option>
+                          <option value="Ignore">Ignore</option>
+                        </select>
+                      </label>
+
+                      <label class="settings-field">
+                        <span>Group</span>
+                        <input id="chart-account-group" type="text" maxlength="80" placeholder="Legal &amp; Professional Fees" required />
+                      </label>
+
+                      <label class="settings-field">
+                        <span>Account</span>
+                        <input id="chart-account-name" type="text" maxlength="80" placeholder="Outside CPA" required />
+                      </label>
+                    </div>
+
+                    <label class="settings-field">
+                      <span>Guidance</span>
+                      <textarea id="chart-account-guidance" rows="2" maxlength="240" placeholder="Tell the verifier when this account should be used."></textarea>
+                    </label>
+
+                    <button class="btn btn-primary btn-inline" type="submit">
+                      <span>Add Custom Account</span>
+                    </button>
+                  </form>
+
+                  <div id="chart-account-list" class="settings-list"></div>
+                </section>
+
+                <section class="audit-section settings-column">
+                  <div class="settings-section-head">
+                    <div>
+                      <h4 class="audit-subtitle">Saved Review Rules</h4>
+                      <p class="settings-copy">Inspect every persisted review rule, remap it to a different chart account, disable it, or delete it entirely.</p>
+                    </div>
+                  </div>
+
+                  <div id="review-rule-list" class="settings-list"></div>
+                </section>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -152,7 +524,7 @@
             <polyline points="7 10 12 15 17 10"/>
             <line x1="12" y1="15" x2="12" y2="3"/>
           </svg>
-          <span>Download PDF Report</span>
+          <span id="download-btn-label">Download PDF Report</span>
         </button>
 
         <button id="reset-btn" class="btn btn-secondary">
