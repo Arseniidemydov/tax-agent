@@ -4873,6 +4873,116 @@ function getPublicReviewQuestion(question) {
   };
 }
 
+function buildClientReviewQuestion(question, submittedAnswer) {
+  const publicQuestion = getPublicReviewQuestion(question);
+  const selectedOption = Array.isArray(question.options)
+    ? question.options.find((option) => option.key === submittedAnswer?.optionKey)
+    : null;
+  const decisionScope = normalizeReviewDecisionScope(submittedAnswer?.decisionScope, question);
+  const clientQuestion = normalizeWhitespace(submittedAnswer?.clientQuestion) || buildReviewClientQuestionSuggestion(question);
+
+  return {
+    questionId: question.id,
+    id: `client_${question.id}`,
+    ...publicQuestion,
+    clientQuestion,
+    accountantNote: normalizeWhitespace(submittedAnswer?.note),
+    selectedOptionKey: selectedOption?.key || '',
+    selectedOptionLabel: selectedOption?.label || '',
+    decisionScope,
+    decisionScopeLabel: getReviewDecisionScopeLabel(decisionScope),
+    summary: selectedOption?.label
+      ? `Current accountant plan: ${selectedOption.label}. We are waiting on a client reply before final sign-off.`
+      : 'We are waiting on a client reply before final sign-off.',
+  };
+}
+
+function buildClientReviewState(reviewState, answers, companyProfile = null) {
+  const normalizedAnswers = normalizeReviewAnswersPayload(answers);
+  const answerMap = new Map(normalizedAnswers.map((answer) => [answer.questionId, answer]));
+  const questions = reviewState.questions
+    .map((question) => {
+      const submittedAnswer = answerMap.get(question.id);
+      if (!submittedAnswer?.optionKey || !submittedAnswer?.needsClientAnswer) {
+        return null;
+      }
+
+      const clientQuestion = normalizeWhitespace(submittedAnswer.clientQuestion) || buildReviewClientQuestionSuggestion(question);
+      if (!clientQuestion) {
+        return null;
+      }
+
+      return buildClientReviewQuestion(question, {
+        ...submittedAnswer,
+        clientQuestion,
+      });
+    })
+    .filter(Boolean);
+
+  return {
+    draftAnswers: normalizedAnswers,
+    pendingQuestionIds: questions.map((question) => question.questionId),
+    publicReview: {
+      companyId: companyProfile?.id || reviewState.companyId || null,
+      companyName: companyProfile?.name || '',
+      reviewMode: reviewState.reviewMode || PROFESSIONAL_REVIEW_STANDARD,
+      periodLabel: buildPeriodLabel(reviewState.transactions),
+      signOffState: 'awaiting_client',
+      totalQuestions: questions.length,
+      summary: questions.length > 0
+        ? `Queued ${questions.length} client clarification question(s) before final sign-off.`
+        : 'No client clarification questions are currently queued.',
+      warning: questions.length > 0
+        ? 'The professional P&L stays in draft mode until each queued client item has a response on file.'
+        : null,
+      questions,
+    },
+  };
+}
+
+function buildFinalizedReviewAnswers(reviewState, clientReviewState, answers) {
+  const draftMap = new Map(normalizeReviewAnswersPayload(clientReviewState?.draftAnswers).map((answer) => [answer.questionId, answer]));
+  const clientMap = new Map(normalizeReviewAnswersPayload(answers).map((answer) => [answer.questionId, answer]));
+  const pendingQuestionIds = new Set(Array.isArray(clientReviewState?.pendingQuestionIds) ? clientReviewState.pendingQuestionIds : []);
+  const mergedAnswers = [];
+
+  for (const question of reviewState.questions) {
+    const draftAnswer = draftMap.get(question.id);
+    if (!draftAnswer?.optionKey) {
+      throw new Error(`Missing draft review answer for "${question.title}"`);
+    }
+
+    if (!pendingQuestionIds.has(question.id)) {
+      mergedAnswers.push({
+        ...draftAnswer,
+        clientResponse: '',
+      });
+      continue;
+    }
+
+    const clientAnswer = clientMap.get(question.id);
+    if (!clientAnswer?.optionKey) {
+      throw new Error(`Missing final client clarification decision for "${question.title}"`);
+    }
+
+    const clientResponse = normalizeWhitespace(clientAnswer.clientResponse);
+    if (!clientResponse) {
+      throw new Error(`Missing client response for "${question.title}"`);
+    }
+
+    mergedAnswers.push({
+      ...draftAnswer,
+      optionKey: clientAnswer.optionKey || draftAnswer.optionKey,
+      decisionScope: normalizeReviewDecisionScope(clientAnswer.decisionScope || draftAnswer.decisionScope, question),
+      clientResponse,
+      needsClientAnswer: true,
+      clientQuestion: normalizeWhitespace(draftAnswer.clientQuestion) || buildReviewClientQuestionSuggestion(question),
+    });
+  }
+
+  return mergedAnswers;
+}
+
 async function buildProfessionalReviewState(
   transactions,
   fileErrorCount = 0,
@@ -4963,6 +5073,7 @@ function normalizeReviewAnswersPayload(answers) {
           note: normalizeWhitespace(answer.note),
           needsClientAnswer: Boolean(answer.needsClientAnswer),
           clientQuestion: normalizeWhitespace(answer.clientQuestion),
+          clientResponse: normalizeWhitespace(answer.clientResponse),
           decisionScope: normalizeWhitespace(answer.decisionScope),
         };
       })
@@ -5022,6 +5133,7 @@ function applyReviewAnswers(reviewState, answers) {
       ? normalizeWhitespace(submittedAnswer?.clientQuestion) || buildReviewClientQuestionSuggestion(question)
       : '';
     const decisionScope = normalizeReviewDecisionScope(submittedAnswer?.decisionScope, question);
+    const clientResponse = normalizeWhitespace(submittedAnswer?.clientResponse);
 
     appliedAnswers.push({
       questionId: question.id,
@@ -5032,6 +5144,7 @@ function applyReviewAnswers(reviewState, answers) {
       note: normalizeWhitespace(submittedAnswer?.note),
       needsClientAnswer,
       clientQuestion,
+      clientResponse,
       decisionScope,
       decisionScopeLabel: getReviewDecisionScopeLabel(decisionScope),
     });
@@ -6136,8 +6249,19 @@ function buildProfessionalAudit(
   persistedRuleSummary = null,
   reviewMode = PROFESSIONAL_REVIEW_STANDARD,
 ) {
-  const clientFollowUpCount = Array.isArray(reviewSummary?.answers)
-    ? reviewSummary.answers.filter((answer) => answer.needsClientAnswer && normalizeWhitespace(answer.clientQuestion)).length
+  const queuedClientFollowUpCount = Array.isArray(reviewSummary?.answers)
+    ? reviewSummary.answers.filter((answer) => (
+      answer.needsClientAnswer
+      && normalizeWhitespace(answer.clientQuestion)
+      && !normalizeWhitespace(answer.clientResponse)
+    )).length
+    : 0;
+  const resolvedClientClarificationCount = Array.isArray(reviewSummary?.answers)
+    ? reviewSummary.answers.filter((answer) => (
+      answer.needsClientAnswer
+      && normalizeWhitespace(answer.clientQuestion)
+      && normalizeWhitespace(answer.clientResponse)
+    )).length
     : 0;
   const runOnlyDecisionCount = Array.isArray(reviewSummary?.answers)
     ? reviewSummary.answers.filter((answer) => answer.decisionScope === REVIEW_DECISION_SCOPE_RUN_ONLY).length
@@ -6202,7 +6326,8 @@ function buildProfessionalAudit(
       { label: 'Drift-prone remaps held', value: verifierSummary?.stabilityHeldClusterCount || 0, format: 'count' },
       { label: 'OpenAI auto-mappings applied', value: verifierSummary?.autoAppliedClusterCount || 0, format: 'count' },
       { label: 'User review decisions applied', value: reviewSummary?.resolvedQuestions || 0, format: 'count' },
-      { label: 'Client follow-up questions queued', value: clientFollowUpCount, format: 'count' },
+      { label: 'Client follow-up questions queued', value: queuedClientFollowUpCount, format: 'count' },
+      { label: 'Client clarifications resolved', value: resolvedClientClarificationCount, format: 'count' },
       { label: 'Run-only review decisions', value: runOnlyDecisionCount, format: 'count' },
     ],
     logicSteps: [
@@ -6233,9 +6358,11 @@ function buildProfessionalAudit(
       reviewSummary?.savedRuleSummary?.savedRuleCount
         ? `Saved ${reviewSummary.savedRuleSummary.savedRuleCount.toLocaleString()} answered review cluster(s) as reusable rules for future professional runs.`
         : 'No new reusable review rules were saved during this run.',
-      clientFollowUpCount > 0
-        ? `Queued ${clientFollowUpCount.toLocaleString()} client follow-up question(s) directly from the accountant review inbox.`
-        : 'No client follow-up questions were queued from the accountant review inbox during this run.',
+      resolvedClientClarificationCount > 0
+        ? `Resolved ${resolvedClientClarificationCount.toLocaleString()} client clarification item(s) before finalizing the professional P&L.`
+        : queuedClientFollowUpCount > 0
+          ? `Queued ${queuedClientFollowUpCount.toLocaleString()} client follow-up question(s) directly from the accountant review inbox.`
+          : 'No client follow-up questions were queued from the accountant review inbox during this run.',
       isStrictProfessionalReviewMode(reviewMode)
         ? 'Strict review mode was enabled, so the professional P&L paused for any material or unclear cluster instead of auto-applying verifier remaps.'
         : 'Standard review mode was enabled, so previously approved rules and high-confidence verifier remaps could auto-apply before final review.',
@@ -6262,6 +6389,7 @@ function buildProfessionalAudit(
         note: answer.note,
         needsClientAnswer: Boolean(answer.needsClientAnswer),
         clientQuestion: answer.clientQuestion,
+        clientResponse: answer.clientResponse,
       }))
       : [],
   };
@@ -6422,11 +6550,44 @@ function serializeJob(job) {
     startedAt: job.startedAt,
     updatedAt: job.updatedAt,
     review: job.review || null,
+    clientReview: job.clientReview || null,
     statementMetas: job.statementMetas || [],
   };
 }
 
 const jobs = {};
+
+function finalizeProfessionalReviewJob(job, answers) {
+  const appliedAnswers = applyReviewAnswers(job.reviewState, answers);
+  const savedRuleSummary = persistAppliedReviewRules(job.reviewState, answers);
+  const companyProfile = getCompanyProfileOrThrow(job.companyId);
+  const report = summarizeProfessionalTransactions(job.reviewState.transactions, {
+    resolvedQuestions: appliedAnswers.length,
+    answers: appliedAnswers,
+    savedRuleSummary,
+  }, job.reviewState.statementMetas, job.reviewState.verifierSummary, job.reviewState.persistedRuleSummary, job.reviewMode, companyProfile);
+  persistCompanyClassificationHistory(job.companyId, job.reviewState.transactions);
+
+  job.data = report;
+  job.review = null;
+  job.clientReview = null;
+  job.reviewState = null;
+  job.clientReviewState = null;
+  job.progress = 100;
+  job.updatedAt = new Date().toISOString();
+
+  if (job.errorCount > 0) {
+    job.status = 'completed_with_errors';
+    job.error = `${job.errorCount} of ${job.totalFiles} file(s) failed during AI extraction. The report only includes successfully processed statements.`;
+    job.data.warning = job.error;
+  } else {
+    job.status = 'completed';
+    job.error = null;
+    job.data.warning = null;
+  }
+
+  return serializeJob(job);
+}
 
 function getCompanyProfileFromRequest(req, { allowDefault = true } = {}) {
   const rawCompanyId = normalizeCompanyId(req.query?.companyId || req.body?.companyId);
@@ -6573,7 +6734,9 @@ app.post('/api/upload', upload.array('statements', 20), (req, res) => {
       successCount: 0,
       errorCount: 0,
       review: null,
+      clientReview: null,
       reviewState: null,
+      clientReviewState: null,
       statementMetas: [],
       startedAt: new Date().toISOString(),
     };
@@ -6605,36 +6768,48 @@ app.post('/api/review/:id', (req, res) => {
 
   try {
     const answers = req.body?.answers;
-    const appliedAnswers = applyReviewAnswers(job.reviewState, answers);
-    const savedRuleSummary = persistAppliedReviewRules(job.reviewState, answers);
     const companyProfile = getCompanyProfileOrThrow(job.companyId);
-    const report = summarizeProfessionalTransactions(job.reviewState.transactions, {
-      resolvedQuestions: appliedAnswers.length,
-      answers: appliedAnswers,
-      savedRuleSummary,
-    }, job.reviewState.statementMetas, job.reviewState.verifierSummary, job.reviewState.persistedRuleSummary, job.reviewMode, companyProfile);
-    persistCompanyClassificationHistory(job.companyId, job.reviewState.transactions);
+    const clientReviewState = buildClientReviewState(job.reviewState, answers, companyProfile);
 
-    job.data = report;
-    job.review = null;
-    job.reviewState = null;
-    job.progress = 100;
-    job.updatedAt = new Date().toISOString();
+    if (clientReviewState.publicReview.questions.length > 0) {
+      job.status = 'awaiting_client';
+      job.error = clientReviewState.publicReview.warning || null;
+      job.review = null;
+      job.clientReview = clientReviewState.publicReview;
+      job.clientReviewState = clientReviewState;
+      job.progress = 100;
+      job.updatedAt = new Date().toISOString();
 
-    if (job.errorCount > 0) {
-      job.status = 'completed_with_errors';
-      job.error = `${job.errorCount} of ${job.totalFiles} file(s) failed during AI extraction. The report only includes successfully processed statements.`;
-      job.data.warning = job.error;
-    } else {
-      job.status = 'completed';
-      job.error = null;
-      job.data.warning = null;
+      console.log(`[Job ${job.id}] Accountant review queued ${clientReviewState.publicReview.questions.length} client clarification item(s).`);
+      return res.json(serializeJob(job));
     }
 
+    const payload = finalizeProfessionalReviewJob(job, answers);
     console.log(`[Job ${job.id}] Review completed. Final status ${job.status}.`);
-    res.json(serializeJob(job));
+    res.json(payload);
   } catch (err) {
     console.error(`[Job ${job.id}] Review submission failed:`, err.message);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/client-review/:id', (req, res) => {
+  const job = jobs[req.params.id];
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (job.analysisMode !== PROFESSIONAL_MODE) {
+    return res.status(400).json({ error: 'Client clarification is only available for Professional P&L jobs' });
+  }
+  if (job.status !== 'awaiting_client' || !job.reviewState || !job.clientReviewState) {
+    return res.status(400).json({ error: 'This job is not waiting for client clarification answers' });
+  }
+
+  try {
+    const finalizedAnswers = buildFinalizedReviewAnswers(job.reviewState, job.clientReviewState, req.body?.answers);
+    const payload = finalizeProfessionalReviewJob(job, finalizedAnswers);
+    console.log(`[Job ${job.id}] Client clarification completed. Final status ${job.status}.`);
+    res.json(payload);
+  } catch (err) {
+    console.error(`[Job ${job.id}] Client clarification submission failed:`, err.message);
     res.status(400).json({ error: err.message });
   }
 });
@@ -6722,7 +6897,9 @@ async function processJob(jobId, files, analysisMode, reviewMode = null, company
         job.status = 'awaiting_review';
         job.error = reviewState.publicReview.warning;
         job.review = reviewState.publicReview;
+        job.clientReview = null;
         job.reviewState = reviewState;
+        job.clientReviewState = null;
         job.updatedAt = new Date().toISOString();
         console.log(`[Job ${jobId}] Awaiting user review for ${reviewState.questions.length} question(s).`);
         return;
@@ -6741,7 +6918,9 @@ async function processJob(jobId, files, analysisMode, reviewMode = null, company
       job.progress = 100;
       job.data = report;
       job.review = null;
+      job.clientReview = null;
       job.reviewState = null;
+      job.clientReviewState = null;
       job.updatedAt = new Date().toISOString();
 
       if (errorCount > 0) {
@@ -6894,6 +7073,14 @@ function findQuickReportById(quickReports = {}, reportId = '') {
 }
 
 function getReportExportTarget(body = {}) {
+  if (body?.exportTarget?.kind === 'client-questions') {
+    return {
+      kind: 'client-questions',
+      companyName: normalizeWhitespace(body?.clientReview?.companyName || body?.companyName),
+      reportId: '',
+    };
+  }
+
   if (body?.exportTarget?.kind === 'quick-report') {
     return {
       kind: 'quick-report',
@@ -6905,12 +7092,21 @@ function getReportExportTarget(body = {}) {
 }
 
 function buildPdfFilename(mode, exportTarget, selectedQuickReport = null) {
+  if (exportTarget.kind === 'client-questions') {
+    const companySegment = slugifyFilenameSegment(safeClientQuestionCompanyName(exportTarget.companyName));
+    return `client-questions-${companySegment}.pdf`;
+  }
+
   if (exportTarget.kind === 'quick-report' && selectedQuickReport) {
     const prefix = selectedQuickReport.kind === 'source' ? 'source-account-report' : 'distribution-account-report';
     return `${prefix}-${slugifyFilenameSegment(selectedQuickReport.title)}.pdf`;
   }
 
   return mode === PROFESSIONAL_MODE ? 'professional-profit-and-loss.pdf' : 'bank-statement-report.pdf';
+}
+
+function safeClientQuestionCompanyName(value = '') {
+  return normalizeWhitespace(value) || 'client-questions';
 }
 
 function drawQuickReportMetricCard(doc, x, y, width, label, value) {
@@ -7059,6 +7255,159 @@ function drawQuickReport(doc, data, report) {
     .text('This quick report was generated automatically by Tax Agent.', { align: 'center' });
 }
 
+function drawClientQuestionReport(doc, data, clientReview = {}) {
+  const questions = Array.isArray(clientReview?.questions) ? clientReview.questions : [];
+  const companyName = normalizeWhitespace(clientReview?.companyName || data.companyName) || 'Client';
+  const periodLabel = normalizeWhitespace(clientReview?.periodLabel || data.periodLabel);
+  const summary = normalizeWhitespace(clientReview?.summary);
+  const warning = normalizeWhitespace(clientReview?.warning);
+
+  doc.fontSize(22).font('Helvetica-Bold').fillColor('#16213e')
+    .text('Client Clarification Packet', { align: 'center' });
+  doc.moveDown(0.2);
+  doc.fontSize(10.5).font('Helvetica').fillColor('#4b5563')
+    .text(`Prepared for ${companyName}`, { align: 'center' });
+  if (periodLabel) {
+    doc.text(`Period: ${periodLabel}`, { align: 'center' });
+  }
+  doc.moveDown(0.75);
+
+  const introY = doc.y;
+  doc.roundedRect(50, introY, 495, 86, 10).fill('#f4f7ff');
+  doc.fontSize(12).font('Helvetica-Bold').fillColor('#1f4f96')
+    .text('What We Need From The Client', 68, introY + 12);
+  doc.fontSize(9.5).font('Helvetica').fillColor('#334155')
+    .text(
+      summary || 'These items need client clarification before the professional P&L can be finalized confidently.',
+      68,
+      introY + 34,
+      { width: 455, lineGap: 2 },
+    );
+  if (warning) {
+    doc.fontSize(8.8).font('Helvetica-Bold').fillColor('#9a3412')
+      .text(warning, 68, introY + 60, { width: 455, lineGap: 2 });
+  }
+  doc.y = introY + 102;
+
+  if (questions.length === 0) {
+    doc.fontSize(10).font('Helvetica').fillColor('#64748b')
+      .text('No client clarification questions were queued for this professional run.', { align: 'center' });
+    doc.moveDown(1.5);
+    doc.fontSize(8).font('Helvetica').fillColor('#999')
+      .text('This packet was generated automatically by Tax Agent.', { align: 'center' });
+    return;
+  }
+
+  questions.forEach((question, index) => {
+    const contentWidth = 455;
+    const examples = Array.isArray(question.sampleDescriptions) ? question.sampleDescriptions.filter(Boolean).slice(0, 3) : [];
+    const sourceFiles = Array.isArray(question.sourceFiles) ? question.sourceFiles.filter(Boolean) : [];
+    const optionPreview = Array.isArray(question.options)
+      ? question.options.slice(0, 3).map((option) => option.label).filter(Boolean).join(' / ')
+      : '';
+    const chips = [
+      `${(Number(question.transactionCount) || 0).toLocaleString()} transaction(s)`,
+      question.selectedOptionLabel ? `Planned decision: ${question.selectedOptionLabel}` : '',
+      question.clusterLabel ? `Cluster: ${question.clusterLabel}` : '',
+    ].filter(Boolean);
+    const questionHeight = doc.heightOfString(question.clientQuestion || 'Please clarify this transaction cluster.', {
+      width: contentWidth,
+      lineGap: 2,
+    });
+    const accountantNoteHeight = question.accountantNote
+      ? doc.heightOfString(question.accountantNote, { width: contentWidth, lineGap: 2 })
+      : 0;
+    const chipsHeight = chips.length > 0
+      ? doc.heightOfString(chips.join('  •  '), { width: contentWidth, lineGap: 2 })
+      : 0;
+    const examplesHeight = examples.length > 0
+      ? doc.heightOfString(examples.join(' | '), { width: contentWidth, lineGap: 2 })
+      : 0;
+    const optionPreviewHeight = optionPreview
+      ? doc.heightOfString(`Current bookkeeping options under consideration: ${optionPreview}`, { width: contentWidth, lineGap: 2 })
+      : 0;
+    const sourceHeight = sourceFiles.length > 0
+      ? doc.heightOfString(`Source file(s): ${sourceFiles.join(', ')}`, { width: contentWidth, lineGap: 2 })
+      : 0;
+    const cardHeight = Math.max(
+      188,
+      92
+      + questionHeight
+      + accountantNoteHeight
+      + chipsHeight
+      + examplesHeight
+      + optionPreviewHeight
+      + sourceHeight,
+    );
+    const estimatedHeight = cardHeight + 24;
+    if (doc.y + estimatedHeight > doc.page.height - doc.page.margins.bottom) {
+      doc.addPage();
+      doc.y = doc.page.margins.top;
+    }
+
+    const cardY = doc.y;
+    const impactedAmount = formatCurrency(question.totalAmount || 0);
+
+    doc.roundedRect(50, cardY, 495, cardHeight, 12)
+      .fillAndStroke('#ffffff', '#d9e2f2');
+    doc.fontSize(9).font('Helvetica-Bold').fillColor('#c2410c')
+      .text(`CLIENT ITEM ${index + 1} OF ${questions.length}`, 68, cardY + 14);
+    doc.fontSize(10.5).font('Helvetica-Bold').fillColor('#16213e')
+      .text(question.title || 'Client clarification needed', 68, cardY + 34, { width: 340 });
+    doc.fontSize(9).font('Helvetica-Bold').fillColor('#1f4f96')
+      .text(`${impactedAmount} impacted`, 430, cardY + 34, { width: 93, align: 'right' });
+
+    let cursorY = cardY + 62;
+    doc.fontSize(9.5).font('Helvetica-Bold').fillColor('#334155')
+      .text('Question for client', 68, cursorY);
+    cursorY += 16;
+    doc.fontSize(9.4).font('Helvetica').fillColor('#334155')
+      .text(question.clientQuestion || 'Please clarify this transaction cluster.', 68, cursorY, { width: contentWidth, lineGap: 2 });
+    cursorY = doc.y + 10;
+
+    if (question.accountantNote) {
+      doc.fontSize(8.8).font('Helvetica-Bold').fillColor('#475569')
+        .text('Accountant context', 68, cursorY);
+      cursorY += 14;
+      doc.fontSize(8.8).font('Helvetica').fillColor('#475569')
+        .text(question.accountantNote, 68, cursorY, { width: contentWidth, lineGap: 2 });
+      cursorY = doc.y + 8;
+    }
+
+    if (chips.length > 0) {
+      doc.fontSize(8.2).font('Helvetica').fillColor('#64748b')
+        .text(chips.join('  •  '), 68, cursorY, { width: contentWidth, lineGap: 2 });
+      cursorY = doc.y + 8;
+    }
+
+    if (examples.length > 0) {
+      doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#334155')
+        .text('Examples', 68, cursorY);
+      cursorY += 12;
+      doc.fontSize(8.5).font('Helvetica').fillColor('#475569')
+        .text(examples.join(' | '), 68, cursorY, { width: contentWidth, lineGap: 2 });
+      cursorY = doc.y + 8;
+    }
+
+    if (optionPreview) {
+      doc.fontSize(8.5).font('Helvetica').fillColor('#64748b')
+        .text(`Current bookkeeping options under consideration: ${optionPreview}`, 68, cursorY, { width: contentWidth, lineGap: 2 });
+      cursorY = doc.y + 8;
+    }
+
+    if (sourceFiles.length > 0) {
+      doc.fontSize(8.2).font('Helvetica').fillColor('#94a3b8')
+        .text(`Source file(s): ${sourceFiles.join(', ')}`, 68, cursorY, { width: contentWidth, lineGap: 2 });
+    }
+
+    doc.y = cardY + cardHeight + 14;
+  });
+
+  doc.moveDown(0.8);
+  doc.fontSize(8).font('Helvetica').fillColor('#999')
+    .text('This client clarification packet was generated automatically by Tax Agent.', { align: 'center' });
+}
+
 function drawProfessionalReport(doc, data) {
   const {
     transactionCount = 0,
@@ -7167,9 +7516,15 @@ app.post('/api/report', (req, res) => {
     const selectedQuickReport = exportTarget.kind === 'quick-report'
       ? findQuickReportById(req.body.quickReports, exportTarget.reportId)
       : null;
+    const clientReview = exportTarget.kind === 'client-questions'
+      ? (req.body?.clientReview && typeof req.body.clientReview === 'object' ? req.body.clientReview : null)
+      : null;
 
     if (exportTarget.kind === 'quick-report' && !selectedQuickReport) {
       return res.status(400).json({ error: 'Selected quick report could not be found in the current professional report payload.' });
+    }
+    if (exportTarget.kind === 'client-questions' && !clientReview) {
+      return res.status(400).json({ error: 'Client clarification packet data is missing from the current review payload.' });
     }
 
     const doc = new PDFDocument({
@@ -7185,6 +7540,8 @@ app.post('/api/report', (req, res) => {
 
     if (exportTarget.kind === 'quick-report' && selectedQuickReport) {
       drawQuickReport(doc, req.body, selectedQuickReport);
+    } else if (exportTarget.kind === 'client-questions' && clientReview) {
+      drawClientQuestionReport(doc, req.body, clientReview);
     } else if (mode === PROFESSIONAL_MODE) {
       drawProfessionalReport(doc, req.body);
     } else {

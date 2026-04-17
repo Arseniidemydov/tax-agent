@@ -185,6 +185,29 @@
           </button>
         </div>
 
+        <div id="client-results-view" style="display:none;">
+          <div id="client-summary-note" class="insight-note">
+            We are waiting on client clarification before the professional P&amp;L can be finalized.
+          </div>
+
+          <div id="client-inbox-stats" class="review-inbox-stats"></div>
+
+          <div class="client-review-toolbar">
+            <div class="client-review-copy">
+              Export the client question packet, capture the reply for each item, then finalize the professional P&amp;L.
+            </div>
+            <button id="client-download-btn" class="btn btn-secondary btn-inline" type="button">
+              <span>Download Client Questions PDF</span>
+            </button>
+          </div>
+
+          <div id="client-questions" class="review-question-list"></div>
+
+          <button id="client-submit-btn" class="btn btn-primary">
+            <span>Finalize P&amp;L After Client Answers</span>
+          </button>
+        </div>
+
         <div id="simple-results-view">
           <!-- Summary Cards -->
           <div class="summary-grid">
@@ -420,7 +443,7 @@
               </div>
 
               <div id="pnl-audit-client-section" class="audit-section" style="display:none;">
-                <h4 class="audit-subtitle">Client Follow-up Queue</h4>
+                <h4 class="audit-subtitle">Client Clarifications</h4>
                 <div id="pnl-audit-client-questions" class="audit-decision-list"></div>
               </div>
             </div>

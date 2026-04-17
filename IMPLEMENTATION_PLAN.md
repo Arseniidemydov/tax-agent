@@ -63,8 +63,11 @@ That means matching or exceeding:
 - Accountant review inbox inside the professional flow with:
   - per-question accountant notes
   - client follow-up question drafting
+  - dedicated `awaiting_client` sign-off gate for unresolved client items
+  - exportable client clarification packet PDF
+  - answer intake tied back to the exact review item before finalization
   - explicit `this run only` vs `save for future company runs` decision scope
-  - final audit visibility for both notes and queued client questions
+  - final audit visibility for notes, client questions, and resolved client responses
 - Professional audit panel explaining formulas, transfer handling, and review decisions
 - Better transfer clustering for review questions
 - OpenAI second-pass cluster verifier for professional mode
@@ -421,6 +424,9 @@ The professional review step now behaves more like an accountant workbench than 
 
 - each review card can capture an accountant note before the P&L is finalized
 - each review card can draft and queue a client-facing follow-up question
+- queued client items now move the job into a dedicated `awaiting_client` stage instead of pretending the statement is done
+- queued client questions can be exported as a clean PDF packet for the client
+- client replies can be captured against the exact queued item before final sign-off
 - review decisions now have explicit scope:
   - `This run only`
   - `Save for future company runs`
@@ -429,8 +435,9 @@ The professional review step now behaves more like an accountant workbench than 
   - whether it was run-only or reusable
   - any accountant note
   - the queued client follow-up question, when one was created
+  - the final client response, when one was required and captured
 
-This is an important bridge between the model layer and actual accountant workflow, because the app can now preserve judgment, not just a bucket choice.
+This is an important bridge between the model layer and actual accountant workflow, because the app can now preserve judgment, pause for client clarification, and only finalize after that clarification is on file.
 
 ## Phase 6: Persistence And Reconciliation
 
@@ -457,8 +464,9 @@ Move from "AI report generator" to a bookkeeping system.
   - finish validating the new refund / NSF memo normalization against the full annual Flo pack, now with verifier batching enabled
   - refine explicit decision rules for operating refunds vs non-operating/travel refunds
   - broaden the new history-backed remap suppression beyond the March smoke-test families, especially for refund / transfer-like memo variants
-- Build on the new accountant inbox:
-  - add `ask client later` packet/export support so queued client questions can be shared cleanly
+- Build on the new accountant/client loop:
+  - turn the client clarification packet into a fuller round-trip workflow, such as shareable links or structured answer import
+  - add a clearer `ready to finalize` vs `waiting on client` sign-off dashboard state across runs
   - allow a review answer to become a saved rule directly from the audit/results view without waiting for the next rerun
   - consider anchored per-cluster chat only after the structured inbox proves itself
 - Tighten the remaining `Legal & Professional Fees` gap by identifying which trust-company, law-firm, advisory, and settlement-related vendors are still leaking into generic expenses or meals
