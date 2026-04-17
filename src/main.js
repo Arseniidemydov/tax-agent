@@ -541,6 +541,7 @@ function renderReviewQuestions(questions) {
     const sampleText = Array.isArray(question.sampleDescriptions) && question.sampleDescriptions.length > 0
       ? `Examples: ${escapeHtml(question.sampleDescriptions.join(' | '))}`
       : '';
+    const currentClassificationLabel = question.type === 'coverage_review' ? 'Current status' : 'Current guess';
 
     const optionsHtml = question.options.map((option) => `
       <label class="review-option">
@@ -561,7 +562,7 @@ function renderReviewQuestions(questions) {
       <p class="review-question-copy">${escapeHtml(question.prompt)}</p>
       <div class="review-question-meta">
         <div class="review-meta-chip">${escapeHtml(question.transactionCount.toLocaleString())} transaction(s)</div>
-        <div class="review-meta-chip">Current guess: ${escapeHtml(question.currentClassification)}</div>
+        <div class="review-meta-chip">${escapeHtml(currentClassificationLabel)}: ${escapeHtml(question.currentClassification)}</div>
         ${suggestedClassification}
         ${verifierConfidence}
         <div class="review-meta-chip">${escapeHtml(question.reason)}</div>

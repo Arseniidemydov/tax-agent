@@ -52,6 +52,7 @@ const GEMINI_TIMEOUT_MS = Number.parseInt(process.env.GEMINI_TIMEOUT_MS || '1200
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const OPENAI_TIMEOUT_MS = Number.parseInt(process.env.OPENAI_TIMEOUT_MS || '45000', 10);
+const OPENAI_VERIFIER_BATCH_SIZE = Math.max(1, Number.parseInt(process.env.OPENAI_VERIFIER_BATCH_SIZE || '6', 10) || 6);
 const OPENAI_VERIFIER_MIN_CLUSTER_AMOUNT = Number.parseFloat(process.env.OPENAI_VERIFIER_MIN_CLUSTER_AMOUNT || '750');
 const OPENAI_VERIFIER_AUTO_APPLY_CONFIDENCE = Number.parseFloat(process.env.OPENAI_VERIFIER_AUTO_APPLY_CONFIDENCE || '0.88');
 const COMPANY_PROFILES_STORE_PATH = path.join(projectRoot, 'data', 'company-profiles.json');
@@ -60,6 +61,7 @@ const CHART_OF_ACCOUNTS_STORE_PATH = path.join(projectRoot, 'data', 'chart-of-ac
 const CHART_OF_ACCOUNTS_STORE_VERSION = 1;
 const REVIEW_RULES_STORE_PATH = path.join(projectRoot, 'data', 'review-rules.json');
 const REVIEW_RULES_STORE_VERSION = 1;
+const CLASSIFICATION_HISTORY_STORE_VERSION = 1;
 
 const SIMPLE_MODE = 'simple';
 const PROFESSIONAL_MODE = 'professional';
@@ -537,6 +539,118 @@ function createEmptyReviewRuleStore() {
   };
 }
 
+function createEmptyClassificationHistoryStore() {
+  return {
+    version: CLASSIFICATION_HISTORY_STORE_VERSION,
+    updatedAt: null,
+    clusters: [],
+  };
+}
+
+function buildClassificationHistoryCompositeKey(bucketKey = '', transactionType = 'unknown') {
+  return `${normalizeWhitespace(transactionType) || 'unknown'}::${normalizeWhitespace(bucketKey)}`;
+}
+
+function parseClassificationLabel(label = '') {
+  const [section = '', group = '', account = ''] = normalizeWhitespace(label).split(' / ');
+  return {
+    section: normalizePlSection(section) || section,
+    group: normalizeWhitespace(group),
+    account: normalizeWhitespace(account),
+  };
+}
+
+function normalizeClassificationHistoryCount(rawEntry) {
+  if (!rawEntry || typeof rawEntry !== 'object') return null;
+
+  const rawLabel = coercePersistedRuleString(rawEntry.label);
+  const parsedLabel = rawLabel ? parseClassificationLabel(rawLabel) : { section: '', group: '', account: '' };
+  const section = normalizePlSection(rawEntry.section || parsedLabel.section);
+  const group = normalizeWhitespace(rawEntry.group || parsedLabel.group);
+  const account = normalizeWhitespace(rawEntry.account || parsedLabel.account || group);
+  const count = Math.max(0, Number.parseInt(rawEntry.count || '0', 10) || 0);
+
+  if (!section || !group || !account || count <= 0) {
+    return null;
+  }
+
+  return {
+    label: buildClassificationLabel(section, group, account),
+    section,
+    group,
+    account,
+    count,
+  };
+}
+
+function normalizeSignalCounts(rawCounts = {}) {
+  const coerceCount = (value) => Math.max(0, Number.parseInt(value || '0', 10) || 0);
+  return {
+    refundLikeCount: coerceCount(rawCounts.refundLikeCount),
+    returnedItemCount: coerceCount(rawCounts.returnedItemCount),
+    operatingRefundSignalCount: coerceCount(rawCounts.operatingRefundSignalCount),
+    nonOperatingRefundSignalCount: coerceCount(rawCounts.nonOperatingRefundSignalCount),
+    bankFeeCount: coerceCount(rawCounts.bankFeeCount),
+    transferSignalCount: coerceCount(rawCounts.transferSignalCount),
+    creditCardPaymentCount: coerceCount(rawCounts.creditCardPaymentCount),
+    priorDepositMatchCount: coerceCount(rawCounts.priorDepositMatchCount),
+    priorDeductionMatchCount: coerceCount(rawCounts.priorDeductionMatchCount),
+  };
+}
+
+function normalizeClassificationHistoryEntry(rawEntry, index = 0) {
+  if (!rawEntry || typeof rawEntry !== 'object') return null;
+
+  const bucketKey = coercePersistedRuleString(rawEntry.bucketKey);
+  const transactionType = coercePersistedRuleString(rawEntry.transactionType) || 'unknown';
+  if (!bucketKey) return null;
+
+  const classificationCounts = Array.isArray(rawEntry.classificationCounts)
+    ? rawEntry.classificationCounts.map(normalizeClassificationHistoryCount).filter(Boolean)
+    : [];
+  const sortedCounts = classificationCounts.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+  const dominantFromCounts = sortedCounts[0] || null;
+  const dominantRaw = rawEntry.dominantClassification && typeof rawEntry.dominantClassification === 'object'
+    ? rawEntry.dominantClassification
+    : null;
+  const dominantSection = normalizePlSection(dominantRaw?.section || dominantRaw?.plSection || dominantFromCounts?.section);
+  const dominantGroup = normalizeWhitespace(dominantRaw?.group || dominantRaw?.plGroup || dominantFromCounts?.group);
+  const dominantAccount = normalizeWhitespace(dominantRaw?.account || dominantRaw?.plAccount || dominantFromCounts?.account || dominantGroup);
+  const totalTransactions = Math.max(
+    sortedCounts.reduce((sum, entry) => sum + entry.count, 0),
+    Number.parseInt(rawEntry.totalTransactions || '0', 10) || 0,
+  );
+
+  if (!dominantSection || !dominantGroup || !dominantAccount || totalTransactions <= 0) {
+    return null;
+  }
+
+  return {
+    id: coercePersistedRuleString(rawEntry.id) || `cluster_history_${index + 1}`,
+    bucketKey,
+    bucketLabel: coercePersistedRuleString(rawEntry.bucketLabel) || bucketKey,
+    transactionType,
+    totalTransactions,
+    totalAmount: roundCurrency(rawEntry.totalAmount || 0),
+    runCount: Math.max(1, Number.parseInt(rawEntry.runCount || '1', 10) || 1),
+    manualReviewCount: Math.max(0, Number.parseInt(rawEntry.manualReviewCount || '0', 10) || 0),
+    savedRuleCount: Math.max(0, Number.parseInt(rawEntry.savedRuleCount || '0', 10) || 0),
+    classificationCounts: sortedCounts,
+    dominantClassification: {
+      section: dominantSection,
+      group: dominantGroup,
+      account: dominantAccount,
+    },
+    signalCounts: normalizeSignalCounts(rawEntry.signalCounts || {}),
+    sampleDescriptions: Array.isArray(rawEntry.sampleDescriptions)
+      ? rawEntry.sampleDescriptions.map((value) => coercePersistedRuleString(value)).filter(Boolean).slice(0, 5)
+      : [],
+    createdAt: coercePersistedRuleString(rawEntry.createdAt) || new Date().toISOString(),
+    updatedAt: coercePersistedRuleString(rawEntry.updatedAt) || new Date().toISOString(),
+    lastSeenAt: coercePersistedRuleString(rawEntry.lastSeenAt) || coercePersistedRuleString(rawEntry.updatedAt) || new Date().toISOString(),
+  };
+}
+
 function normalizePersistedReviewRule(rawRule, index = 0) {
   if (!rawRule || typeof rawRule !== 'object') return null;
 
@@ -647,6 +761,11 @@ function createInitialCompanyProfile({
         .map((rule, index) => normalizePersistedReviewRule(rule, index))
         .filter(Boolean),
     },
+    classificationHistory: {
+      version: CLASSIFICATION_HISTORY_STORE_VERSION,
+      updatedAt: timestamp,
+      clusters: [],
+    },
   };
 }
 
@@ -665,6 +784,11 @@ function normalizeCompanyProfile(rawProfile, index = 0) {
     : Array.isArray(rawProfile.reviewRules)
       ? rawProfile.reviewRules
       : [];
+  const classificationHistoryPayload = Array.isArray(rawProfile.classificationHistory?.clusters)
+    ? rawProfile.classificationHistory.clusters
+    : Array.isArray(rawProfile.classificationHistory)
+      ? rawProfile.classificationHistory
+      : [];
 
   return {
     id: normalizedId,
@@ -681,6 +805,13 @@ function normalizeCompanyProfile(rawProfile, index = 0) {
       updatedAt: coercePersistedRuleString(rawProfile.reviewRules?.updatedAt) || null,
       rules: reviewRulesPayload
         .map((rule, ruleIndex) => normalizePersistedReviewRule(rule, ruleIndex))
+        .filter(Boolean),
+    },
+    classificationHistory: {
+      version: Number.parseInt(rawProfile.classificationHistory?.version || `${CLASSIFICATION_HISTORY_STORE_VERSION}`, 10) || CLASSIFICATION_HISTORY_STORE_VERSION,
+      updatedAt: coercePersistedRuleString(rawProfile.classificationHistory?.updatedAt) || null,
+      clusters: classificationHistoryPayload
+        .map((entry, historyIndex) => normalizeClassificationHistoryEntry(entry, historyIndex))
         .filter(Boolean),
     },
   };
@@ -823,6 +954,7 @@ function updateCompanyProfileStore(companyId, updater) {
 function serializeCompanyProfileSummary(companyProfile) {
   const chartAccounts = getConfiguredProfessionalVerifierClassifications(companyProfile, { includeDisabled: true });
   const reviewRules = Array.isArray(companyProfile?.reviewRules?.rules) ? companyProfile.reviewRules.rules : [];
+  const classificationHistory = Array.isArray(companyProfile?.classificationHistory?.clusters) ? companyProfile.classificationHistory.clusters : [];
 
   return {
     id: companyProfile.id,
@@ -832,6 +964,7 @@ function serializeCompanyProfileSummary(companyProfile) {
     customChartAccountCount: chartAccounts.filter((entry) => !entry.builtIn).length,
     activeReviewRuleCount: reviewRules.filter((rule) => rule.enabled !== false).length,
     totalReviewRuleCount: reviewRules.length,
+    historicalClusterCount: classificationHistory.length,
     createdAt: companyProfile.createdAt,
     updatedAt: companyProfile.updatedAt,
   };
@@ -881,6 +1014,7 @@ function createCompanyProfile(rawPayload = {}) {
       accounts: createDefaultChartAccountEntries(),
     },
     reviewRules: createEmptyReviewRuleStore(),
+    classificationHistory: createEmptyClassificationHistoryStore(),
   }, companies.length);
 
   companyProfilesStore = {
@@ -1121,6 +1255,43 @@ const TRANSFER_FINGERPRINT_STOPWORDS = new Set([
   'ACCT',
 ]);
 
+const ADJUSTMENT_FINGERPRINT_STOPWORDS = new Set([
+  ...REVIEW_FINGERPRINT_STOPWORDS,
+  'ACH',
+  'ADJUSTMENT',
+  'ADJUSTMENTS',
+  'BANK',
+  'CARD',
+  'CREDIT',
+  'CREDITS',
+  'DAY',
+  'DEPOSIT',
+  'DEPOSITED',
+  'EFUND',
+  'FEDWIRE',
+  'FROM',
+  'INTL',
+  'INTERNATIONAL',
+  'ITEM',
+  'ITEMS',
+  'NSF',
+  'ONLINE',
+  'PAYMENT',
+  'PAYMENTS',
+  'REFUND',
+  'REFUNDS',
+  'RETURN',
+  'RETURNED',
+  'REVERSAL',
+  'REVERSALS',
+  'SAME',
+  'TO',
+  'TRANSFER',
+  'TRANSFERS',
+  'TRIPR',
+  'WIRE',
+]);
+
 const TRANSFER_BENEFICIARY_PATTERNS = [
   /\bBEN(?:EFICIARY)?\s*:?\s*(.+?)(?=\b(?:REF|REFERENCE|A\/C|ACCOUNT|ACCT|ABA|SWIFT|ROUTING|IMAD|OMAD|TRN|FED REF)\b[: ]|$)/i,
   /\bB\/O\s*:?\s*(.+?)(?=\b(?:REF|REFERENCE|A\/C|ACCOUNT|ACCT|ABA|SWIFT|ROUTING|IMAD|OMAD|TRN|FED REF)\b[: ]|$)/i,
@@ -1286,6 +1457,23 @@ function normalizeFingerprintSource(value) {
     .toUpperCase();
 }
 
+function normalizeAdjustmentMemoSource(value = '') {
+  return normalizeFingerprintSource(value)
+    .replace(/\bEFUND\b/g, 'REFUND')
+    .replace(/\bREFUNDS?\b/g, 'REFUND')
+    .replace(/\bREV(?:ERSAL|ERS)?\b/g, 'REVERSAL')
+    .replace(/\bCREDITS?\b/g, 'CREDIT')
+    .replace(/\bRTRN(?:ED)?\b/g, 'RETURNED')
+    .replace(/\bDEPOSITED ITEM RETURNED NSF\b/g, 'RETURNED ITEM NSF')
+    .replace(/\bRETURNED DEPOSIT(?:ED)? ITEM NSF\b/g, 'RETURNED ITEM NSF')
+    .replace(/\bRETURNED NSF ITEM\b/g, 'RETURNED ITEM NSF')
+    .replace(/\bNSF RETURN(?:ED)?(?: ITEM)?\b/g, 'RETURNED ITEM NSF')
+    .replace(/\bRETURN(?:ED)? ITEM NSF\b/g, 'RETURNED ITEM NSF')
+    .replace(/\bRETURNED NSF\b/g, 'RETURNED ITEM NSF')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function tokenizeFingerprint(value, stopwords = REVIEW_FINGERPRINT_STOPWORDS) {
   const normalized = normalizeFingerprintSource(value)
     .replace(/\b\d{4,}\b/g, ' ')
@@ -1307,7 +1495,76 @@ function tokenizeFingerprint(value, stopwords = REVIEW_FINGERPRINT_STOPWORDS) {
   return tokens;
 }
 
+function isRefundLikeDescription(description = '') {
+  const normalized = normalizeAdjustmentMemoSource(description);
+  if (!normalized) return false;
+  if (isReturnedItemDescription(normalized)) return true;
+  if (/\bCREDIT CARD\b/.test(normalized) && !/\b(?:REFUND|REVERSAL)\b/.test(normalized)) {
+    return false;
+  }
+  return /\b(?:REFUND|REVERSAL|CREDIT)\b/.test(normalized);
+}
+
+function isReturnedItemFeeDescription(description = '') {
+  const normalized = normalizeAdjustmentMemoSource(description);
+  return /\b(?:RETURNED ITEM NSF|RETURNED ITEM|NSF)\b.*\bFEE\b/i.test(normalized)
+    || /\bFEE\b.*\b(?:RETURNED ITEM NSF|RETURNED ITEM|NSF)\b/i.test(normalized);
+}
+
+function buildAdjustmentFingerprint(value) {
+  const normalized = normalizeAdjustmentMemoSource(value);
+  if (!normalized) {
+    return {
+      key: '',
+      label: normalizeDescription(value),
+    };
+  }
+
+  if (isReturnedItemFeeDescription(normalized)) {
+    return {
+      key: 'ADJ::RETURNED_ITEM_FEE',
+      label: 'Returned Item / NSF Fee',
+    };
+  }
+
+  if (isReturnedItemDescription(normalized)) {
+    return {
+      key: 'ADJ::RETURNED_ITEM_NSF',
+      label: 'Deposited Item Returned NSF',
+    };
+  }
+
+  const family = isNonOperatingRefundAdjustment(normalized)
+    ? 'NON_OPERATING_REFUND'
+    : isOperatingVendorRefundCreditDescription(normalized)
+      ? 'OPERATING_REFUND'
+      : 'REFUND';
+  const familyLabel = family === 'NON_OPERATING_REFUND'
+    ? 'Non-operating refund / credit'
+    : family === 'OPERATING_REFUND'
+      ? 'Operating refund / credit'
+      : 'Refund / credit';
+  const tokenList = tokenizeFingerprint(normalized, ADJUSTMENT_FINGERPRINT_STOPWORDS).slice(0, 8);
+  const tokenKey = tokenList.join(' ');
+
+  if (!tokenKey) {
+    return {
+      key: `ADJ::${family}::GENERIC`,
+      label: familyLabel,
+    };
+  }
+
+  return {
+    key: `ADJ::${family}::${tokenKey}`,
+    label: `${familyLabel}: ${toDisplayTitleCase(tokenKey)}`,
+  };
+}
+
 function buildDescriptionFingerprint(value) {
+  if (isRefundLikeDescription(value) || isReturnedItemFeeDescription(value) || isNonOperatingRefundAdjustment(value)) {
+    return buildAdjustmentFingerprint(value).key;
+  }
+
   return tokenizeFingerprint(value).slice(0, 12).join(' ');
 }
 
@@ -1368,6 +1625,17 @@ function buildTransferFingerprint(value) {
 function buildReviewBucketInfo(signalType, tx) {
   if (signalType === 'transfer_review') {
     return buildTransferFingerprint(tx.description);
+  }
+
+  if (signalType === 'refund_review') {
+    return buildAdjustmentFingerprint(tx.description);
+  }
+
+  if (
+    signalType === 'verifier_category_review'
+    && (isRefundLikeDescription(tx.description) || isReturnedItemFeeDescription(tx.description) || isNonOperatingRefundAdjustment(tx.description))
+  ) {
+    return buildAdjustmentFingerprint(tx.description);
   }
 
   const descriptionFingerprint = buildDescriptionFingerprint(tx.description);
@@ -1440,6 +1708,258 @@ function getCompanyReviewRuleStore(companyProfile = null) {
   return companyProfile?.reviewRules && typeof companyProfile.reviewRules === 'object'
     ? companyProfile.reviewRules
     : createEmptyReviewRuleStore();
+}
+
+function getCompanyClassificationHistoryStore(companyProfile = null) {
+  return companyProfile?.classificationHistory && typeof companyProfile.classificationHistory === 'object'
+    ? companyProfile.classificationHistory
+    : createEmptyClassificationHistoryStore();
+}
+
+function pickPreferredClusterLabel(currentLabel = '', nextLabel = '') {
+  const current = normalizeWhitespace(currentLabel);
+  const next = normalizeWhitespace(nextLabel);
+  if (!current) return next;
+  if (!next) return current;
+  return next.length > current.length ? next : current;
+}
+
+function mergeSampleDescriptionLists(existing = [], additions = [], maxItems = 5) {
+  return Array.from(new Set([
+    ...existing.map((value) => normalizeWhitespace(value)).filter(Boolean),
+    ...additions.map((value) => normalizeWhitespace(value)).filter(Boolean),
+  ])).slice(0, maxItems);
+}
+
+function buildClassificationHistoryLookup(candidate, companyProfile = null) {
+  const historyStore = getCompanyClassificationHistoryStore(companyProfile);
+  const clusters = Array.isArray(historyStore?.clusters) ? historyStore.clusters : [];
+  const compositeKey = buildClassificationHistoryCompositeKey(candidate?.key, candidate?.dominantType || 'unknown');
+  const matched = clusters.find((entry) => buildClassificationHistoryCompositeKey(entry.bucketKey, entry.transactionType) === compositeKey);
+
+  if (!matched) {
+    return {
+      seenBefore: false,
+      stablePriorClassification: false,
+      conflictingPriorClassification: false,
+      dominantClassificationLabel: '',
+      confidence: 0,
+      runCount: 0,
+      totalTransactions: 0,
+      manualReviewCount: 0,
+      savedRuleCount: 0,
+      classificationOptions: [],
+      sampleDescriptions: [],
+      signalCounts: normalizeSignalCounts({}),
+      lastSeenAt: '',
+    };
+  }
+
+  const totalTransactions = Math.max(1, matched.totalTransactions || 0);
+  const dominantLabel = buildClassificationLabel(
+    matched.dominantClassification.section,
+    matched.dominantClassification.group,
+    matched.dominantClassification.account,
+  );
+  const dominantCount = matched.classificationCounts[0]?.count || totalTransactions;
+  const confidence = Number((dominantCount / totalTransactions).toFixed(2));
+  const stablePriorClassification = matched.runCount >= 2 && confidence >= 0.75;
+  const conflictingPriorClassification = Boolean(
+    candidate?.currentClassificationLabel
+    && dominantLabel
+    && dominantLabel !== candidate.currentClassificationLabel
+    && confidence >= 0.5
+  );
+
+  return {
+    seenBefore: true,
+    stablePriorClassification,
+    conflictingPriorClassification,
+    dominantClassificationLabel: dominantLabel,
+    confidence,
+    runCount: matched.runCount,
+    totalTransactions,
+    manualReviewCount: matched.manualReviewCount || 0,
+    savedRuleCount: matched.savedRuleCount || 0,
+    classificationOptions: matched.classificationCounts.slice(0, 3).map((entry) => ({
+      label: entry.label,
+      count: entry.count,
+    })),
+    sampleDescriptions: Array.isArray(matched.sampleDescriptions) ? matched.sampleDescriptions.slice(0, 3) : [],
+    signalCounts: normalizeSignalCounts(matched.signalCounts || {}),
+    lastSeenAt: matched.lastSeenAt || '',
+  };
+}
+
+function persistCompanyClassificationHistory(companyId, transactions = []) {
+  if (!companyId || !Array.isArray(transactions) || transactions.length === 0) {
+    return {
+      clusterCount: 0,
+      updatedClusterCount: 0,
+    };
+  }
+
+  const timestamp = new Date().toISOString();
+  const runClusters = new Map();
+  const amountIndex = buildProfessionalVerifierAmountIndex(transactions);
+
+  for (const [index, tx] of transactions.entries()) {
+    if (!tx) continue;
+
+    const bucketInfo = buildReviewBucketInfo('verifier_category_review', tx);
+    const bucketKey = bucketInfo.key || normalizeFingerprintSource(tx.description);
+    if (!bucketKey) continue;
+
+    const compositeKey = buildClassificationHistoryCompositeKey(bucketKey, tx.type || 'unknown');
+    if (!runClusters.has(compositeKey)) {
+      runClusters.set(compositeKey, {
+        bucketKey,
+        bucketLabel: bucketInfo.label || normalizeDescription(tx.description),
+        transactionType: tx.type || 'unknown',
+        totalTransactions: 0,
+        totalAmount: 0,
+        manualReviewCount: 0,
+        savedRuleCount: 0,
+        classificationCounts: new Map(),
+        sampleDescriptions: new Set(),
+        signalCounts: normalizeSignalCounts({}),
+      });
+    }
+
+    const cluster = runClusters.get(compositeKey);
+    const label = buildClassificationLabel(tx.plSection, tx.plGroup, tx.plAccount);
+    const existingCount = cluster.classificationCounts.get(label) || {
+      label,
+      section: tx.plSection,
+      group: tx.plGroup,
+      account: tx.plAccount,
+      count: 0,
+    };
+
+    existingCount.count += 1;
+    cluster.classificationCounts.set(label, existingCount);
+    cluster.totalTransactions += 1;
+    cluster.totalAmount = roundCurrency(cluster.totalAmount + tx.amount);
+    cluster.bucketLabel = pickPreferredClusterLabel(cluster.bucketLabel, bucketInfo.label || tx.description);
+    cluster.sampleDescriptions.add(tx.description);
+    if (tx.classificationMeta?.userReviewApplied) cluster.manualReviewCount += 1;
+    if (tx.classificationMeta?.savedRuleApplied) cluster.savedRuleCount += 1;
+
+    const diagnostics = buildVerifierInternalChecks([
+      {
+        index,
+        tx,
+        dateValue: parsePotentialDate(tx.date)?.getTime() || null,
+      },
+    ], amountIndex);
+    cluster.signalCounts.refundLikeCount += diagnostics.refundLikeCount;
+    cluster.signalCounts.returnedItemCount += diagnostics.returnedItemCount;
+    cluster.signalCounts.operatingRefundSignalCount += diagnostics.operatingRefundSignalCount;
+    cluster.signalCounts.nonOperatingRefundSignalCount += diagnostics.nonOperatingRefundSignalCount;
+    cluster.signalCounts.bankFeeCount += diagnostics.bankFeeCount;
+    cluster.signalCounts.transferSignalCount += diagnostics.transferSignalCount;
+    cluster.signalCounts.creditCardPaymentCount += diagnostics.creditCardPaymentCount;
+    cluster.signalCounts.priorDepositMatchCount += diagnostics.priorDepositMatchCount;
+    cluster.signalCounts.priorDeductionMatchCount += diagnostics.priorDeductionMatchCount;
+  }
+
+  if (runClusters.size === 0) {
+    return {
+      clusterCount: 0,
+      updatedClusterCount: 0,
+    };
+  }
+
+  const companyProfile = getCompanyProfileOrThrow(companyId);
+  const historyStore = getCompanyClassificationHistoryStore(companyProfile);
+  const historyEntries = Array.isArray(historyStore?.clusters) ? historyStore.clusters : [];
+  const historyMap = new Map(
+    historyEntries.map((entry) => [
+      buildClassificationHistoryCompositeKey(entry.bucketKey, entry.transactionType),
+      entry,
+    ]),
+  );
+  let updatedClusterCount = 0;
+
+  for (const [compositeKey, cluster] of runClusters.entries()) {
+    const existing = historyMap.get(compositeKey);
+    const countMap = new Map();
+    const pushCounts = (entries = []) => {
+      entries.forEach((entry) => {
+        if (!entry?.label) return;
+        const current = countMap.get(entry.label) || {
+          label: entry.label,
+          section: entry.section,
+          group: entry.group,
+          account: entry.account,
+          count: 0,
+        };
+        current.count += entry.count || 0;
+        countMap.set(entry.label, current);
+      });
+    };
+
+    pushCounts(existing?.classificationCounts || []);
+    pushCounts(Array.from(cluster.classificationCounts.values()));
+
+    const mergedCounts = Array.from(countMap.values())
+      .filter((entry) => entry.count > 0)
+      .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+    const dominant = mergedCounts[0];
+    if (!dominant) continue;
+
+    const existingSignals = normalizeSignalCounts(existing?.signalCounts || {});
+    const mergedSignalCounts = normalizeSignalCounts({
+      refundLikeCount: existingSignals.refundLikeCount + cluster.signalCounts.refundLikeCount,
+      returnedItemCount: existingSignals.returnedItemCount + cluster.signalCounts.returnedItemCount,
+      operatingRefundSignalCount: existingSignals.operatingRefundSignalCount + cluster.signalCounts.operatingRefundSignalCount,
+      nonOperatingRefundSignalCount: existingSignals.nonOperatingRefundSignalCount + cluster.signalCounts.nonOperatingRefundSignalCount,
+      bankFeeCount: existingSignals.bankFeeCount + cluster.signalCounts.bankFeeCount,
+      transferSignalCount: existingSignals.transferSignalCount + cluster.signalCounts.transferSignalCount,
+      creditCardPaymentCount: existingSignals.creditCardPaymentCount + cluster.signalCounts.creditCardPaymentCount,
+      priorDepositMatchCount: existingSignals.priorDepositMatchCount + cluster.signalCounts.priorDepositMatchCount,
+      priorDeductionMatchCount: existingSignals.priorDeductionMatchCount + cluster.signalCounts.priorDeductionMatchCount,
+    });
+
+    historyMap.set(compositeKey, normalizeClassificationHistoryEntry({
+      id: existing?.id || `cluster_history_${historyMap.size + 1}`,
+      bucketKey: cluster.bucketKey,
+      bucketLabel: pickPreferredClusterLabel(existing?.bucketLabel || '', cluster.bucketLabel),
+      transactionType: cluster.transactionType,
+      totalTransactions: (existing?.totalTransactions || 0) + cluster.totalTransactions,
+      totalAmount: roundCurrency((existing?.totalAmount || 0) + cluster.totalAmount),
+      runCount: (existing?.runCount || 0) + 1,
+      manualReviewCount: (existing?.manualReviewCount || 0) + cluster.manualReviewCount,
+      savedRuleCount: (existing?.savedRuleCount || 0) + cluster.savedRuleCount,
+      classificationCounts: mergedCounts,
+      dominantClassification: {
+        section: dominant.section,
+        group: dominant.group,
+        account: dominant.account,
+      },
+      signalCounts: mergedSignalCounts,
+      sampleDescriptions: mergeSampleDescriptionLists(existing?.sampleDescriptions || [], Array.from(cluster.sampleDescriptions)),
+      createdAt: existing?.createdAt || timestamp,
+      updatedAt: timestamp,
+      lastSeenAt: timestamp,
+    }));
+    updatedClusterCount += 1;
+  }
+
+  updateCompanyProfileStore(companyId, (currentCompany) => ({
+    ...currentCompany,
+    classificationHistory: {
+      ...getCompanyClassificationHistoryStore(currentCompany),
+      version: CLASSIFICATION_HISTORY_STORE_VERSION,
+      updatedAt: timestamp,
+      clusters: Array.from(historyMap.values()).sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || '')),
+    },
+  }));
+
+  return {
+    clusterCount: runClusters.size,
+    updatedClusterCount,
+  };
 }
 
 function findPersistedReviewRuleForTransaction(tx, companyProfile = null) {
@@ -2374,7 +2894,18 @@ function buildSimpleDepositDeductionReport(transactions) {
 }
 
 function looksLikeTransferOrBalanceSheet(tx) {
-  if (tx.type === 'deduction' && isKnownLegalTrustWireDescription(tx.description)) {
+  if (
+    tx.type === 'deduction'
+    && (
+      isBankFeeDescription(tx.description)
+      || isKnownLegalTrustWireDescription(tx.description)
+      || isInternationalBusinessExpenseWireDescription(tx.description)
+    )
+  ) {
+    return false;
+  }
+
+  if (tx.type === 'deposit' && isOperatingVendorRefundCreditDescription(tx.description)) {
     return false;
   }
 
@@ -2442,8 +2973,31 @@ function isKnownLegalTrustWireDescription(description = '') {
   return /FORBES\s+HARE|NEVIS\s+TRUST|CAYMAN\s+(?:NATIONAL|REVOCABLE)|TRUST\s+COMPANY|LAWRENCE\s+CAPLAN|ATG\s+LAW|LAW\s+FIRM|ATTORNEY|LEGAL/i.test(description);
 }
 
+function isBankFeeDescription(description = '') {
+  const normalized = normalizeAdjustmentMemoSource(description);
+  return /STANDARD ACH PMNTS INITIAL FEE|STD ACH PMNTS INITIAL FEE|STANDARD ACH PMNTS VOLUME FEE|STD ACH PMNTS VOLUME FEE|ONLINE US DOLLAR INTL WIRE FEE|ONLINE DOMESTIC WIRE FEE|WIRE FEE|WIRE TRANSFER FEE|ACH FEE|BANK FEE|BANK CHARGE|SERVICE CHARGE|MONTHLY SERVICE FEE|MONTHLY FEE|RETURNED ITEM NSF FEE|RETURNED ITEM FEE|NSF FEE/i.test(normalized);
+}
+
+function isReturnedItemDescription(description = '') {
+  const normalized = normalizeAdjustmentMemoSource(description);
+  if (isReturnedItemFeeDescription(normalized)) {
+    return false;
+  }
+  return /\bRETURNED ITEM NSF\b|\bRETURNED ITEM\b|\bRETURNED NSF\b/i.test(normalized);
+}
+
+function isInternationalBusinessExpenseWireDescription(description = '') {
+  const normalized = normalizeWhitespace(description).toUpperCase();
+  if (!normalized) return false;
+  if (!/(WIRE|TRANSFER|ONLINE|INT)/.test(normalized)) return false;
+  if (/SALARY|PAYROLL/.test(normalized)) return false;
+
+  return /BANCO DE AMERICA(?: CENTRAL)?|BANCO DE LA PRODUCCION/.test(normalized);
+}
+
 function isLegalProfessionalDescription(description = '') {
   return isKnownLegalTrustWireDescription(description)
+    || isInternationalBusinessExpenseWireDescription(description)
     || /CPA|ACCOUNTANT|CONSULT(?:ING)?|ADVISORY|PROFESSIONAL SERVICES?/i.test(description);
 }
 
@@ -2453,7 +3007,7 @@ function isPotentialLegalProfessionalDescription(description = '') {
 }
 
 function isRemoteStaffingDescription(description = '') {
-  return /REMOTE STAFF|REMOTE STAFFING|OUTSOURC|UPWORK|LAURAS?\s+AND\s+ASSOCIATES/i.test(description);
+  return /REMOTE STAFF|REMOTE STAFFING|OUTSOURC|UPWORK|LAURAS?\s+AND\s+ASSOCIATES|ARTURO\s+DOG\s+TRAINER/i.test(description);
 }
 
 function isMealsAndEntertainmentDescription(description = '') {
@@ -2491,10 +3045,21 @@ function isLeadGenerationVendor(description = '') {
     || /\bONLINE ACH PAYMENT TO ST 0791\b/i.test(description);
 }
 
+function isOperatingVendorRefundCreditDescription(description = '') {
+  const normalized = normalizeAdjustmentMemoSource(description);
+  return /\b(?:MOVE\s*AROUND|MOVEAROUND)\b.*\b(REFUND|CREDIT)\b/i.test(normalized)
+    || /\bYACHT CHARTER CREDIT REFUND\b/i.test(normalized);
+}
+
 function isNonOperatingRefundAdjustment(description = '') {
-  return /\bFEDWIRE CREDIT\b.*\b(REFUND|EFUND)\b/i.test(description)
-    || /\bYACHT CHARTER CREDIT REFUND\b/i.test(description)
-    || /\bTRIPR EFUND\b/i.test(description);
+  const normalized = normalizeAdjustmentMemoSource(description);
+  if (isOperatingVendorRefundCreditDescription(normalized)) {
+    return false;
+  }
+
+  return /\bFEDWIRE CREDIT\b.*\bREFUND\b/i.test(normalized)
+    || /\bYACHT CHARTER CREDIT REFUND\b/i.test(normalized)
+    || /\bTRIPR REFUND\b/i.test(normalized);
 }
 
 function isDirectCostAdvertisingSignal(tx, candidate, description = '') {
@@ -2550,6 +3115,22 @@ function applyStrongClassificationRules(tx, candidate) {
   const candidateLabel = `${candidate.section} ${candidate.group} ${candidate.account}`.toUpperCase();
   const combined = `${description} ${candidateLabel}`;
 
+  if (isReturnedItemDescription(description)) {
+    return {
+      classification: { section: 'Ignore', group: 'Transfers', account: 'Returned Deposit' },
+      source: 'rule',
+      reason: 'returned_item_pattern',
+    };
+  }
+
+  if (isReturnedItemFeeDescription(description)) {
+    return {
+      classification: { section: 'Expenses', group: 'Bank Charge service', account: 'Bank Charge service' },
+      source: 'rule',
+      reason: 'returned_item_fee_pattern',
+    };
+  }
+
   if (tx.type === 'deposit') {
     if (isNonOperatingRefundAdjustment(description)) {
       return {
@@ -2575,6 +3156,22 @@ function applyStrongClassificationRules(tx, candidate) {
       classification: { section: 'Expenses', group: 'Legal & Professional Fees', account: 'Legal & Professional Fees' },
       source: 'rule',
       reason: 'legal_trust_wire_pattern',
+    };
+  }
+
+  if (isInternationalBusinessExpenseWireDescription(description)) {
+    return {
+      classification: { section: 'Expenses', group: 'Legal & Professional Fees', account: 'Legal & Professional Fees' },
+      source: 'rule',
+      reason: 'international_business_expense_wire',
+    };
+  }
+
+  if (isBankFeeDescription(description)) {
+    return {
+      classification: { section: 'Expenses', group: 'Bank Charge service', account: 'Bank Charge service' },
+      source: 'rule',
+      reason: 'bank_fee_pattern',
     };
   }
 
@@ -2841,7 +3438,7 @@ function inferProfitAndLossClassification(tx) {
       };
     }
 
-    if (/REFUND|REVERSAL|CREDIT/.test(tx.description.toUpperCase())) {
+    if (isRefundLikeDescription(tx.description)) {
       return {
         section: 'Other Income',
         group: 'Refunds and Credits',
@@ -3054,32 +3651,60 @@ function buildTransferReviewSignal(tx) {
 }
 
 function buildRefundReviewSignal(tx) {
+  const operatingRefundCredit = isOperatingVendorRefundCreditDescription(tx.description);
+  const options = operatingRefundCredit
+    ? [
+        createReviewOption(
+          'sales_income',
+          'Keep as operating income',
+          'Treat these deposits as operating credits that should stay inside Income.',
+          { plSection: 'Income', plGroup: 'Sales', plAccount: 'Sales' },
+        ),
+        createReviewOption(
+          'refund_credit',
+          'Treat as refund or credit',
+          'Place these transactions in Other Income under Refunds & Reversals.',
+          { plSection: 'Other Income', plGroup: 'Refunds and Credits', plAccount: 'Refunds & Reversals' },
+        ),
+        createReviewOption(
+          'exclude',
+          'Exclude from the P&L',
+          'Treat these transactions as non-P&L activity.',
+          { plSection: 'Ignore', plGroup: 'Transfers', plAccount: 'Internal Transfer' },
+        ),
+      ]
+    : [
+        createReviewOption(
+          'refund_credit',
+          'Treat as refund or credit',
+          'Place these transactions in Other Income under Refunds & Reversals.',
+          { plSection: 'Other Income', plGroup: 'Refunds and Credits', plAccount: 'Refunds & Reversals' },
+        ),
+        createReviewOption(
+          'sales_income',
+          'Treat as actual income',
+          'Include these transactions in Income as Sales.',
+          { plSection: 'Income', plGroup: 'Sales', plAccount: 'Sales' },
+        ),
+        createReviewOption(
+          'exclude',
+          'Exclude from the P&L',
+          'Treat these transactions as non-P&L activity.',
+          { plSection: 'Ignore', plGroup: 'Transfers', plAccount: 'Internal Transfer' },
+        ),
+      ];
+
   return {
     type: 'refund_review',
     priority: 2,
     title: `How should we treat "${tx.description}"?`,
-    prompt: 'These deposits look like refunds, reversals, or credits, but the current professional statement would classify them differently.',
-    reason: 'Refund-style wording conflicts with the current P&L classification.',
-    options: [
-      createReviewOption(
-        'refund_credit',
-        'Treat as refund or credit',
-        'Place these transactions in Other Income under Refunds & Reversals.',
-        { plSection: 'Other Income', plGroup: 'Refunds and Credits', plAccount: 'Refunds & Reversals' },
-      ),
-      createReviewOption(
-        'sales_income',
-        'Treat as actual income',
-        'Include these transactions in Income as Sales.',
-        { plSection: 'Income', plGroup: 'Sales', plAccount: 'Sales' },
-      ),
-      createReviewOption(
-        'exclude',
-        'Exclude from the P&L',
-        'Treat these transactions as non-P&L activity.',
-        { plSection: 'Ignore', plGroup: 'Transfers', plAccount: 'Internal Transfer' },
-      ),
-    ],
+    prompt: operatingRefundCredit
+      ? 'These deposits look like operating vendor/customer credits, but the wording also suggests a refund or reversal.'
+      : 'These deposits look like refunds, reversals, or credits, but the current professional statement would classify them differently.',
+    reason: operatingRefundCredit
+      ? 'Refund-style wording appears alongside a known operating counterparty.'
+      : 'Refund-style wording conflicts with the current P&L classification.',
+    options,
   };
 }
 
@@ -3178,7 +3803,7 @@ function getProfessionalReviewSignal(tx) {
     return buildTransferReviewSignal(tx);
   }
 
-  if (tx.type === 'deposit' && /(REFUND|REVERSAL|CREDIT)/.test(upperDescription) && tx.plSection !== 'Other Income' && tx.plSection !== 'Ignore') {
+  if (tx.type === 'deposit' && isRefundLikeDescription(upperDescription) && tx.plSection !== 'Other Income' && tx.plSection !== 'Ignore') {
     return buildRefundReviewSignal(tx);
   }
 
@@ -3213,6 +3838,17 @@ function getSortedCountEntries(map) {
   return Array.from(map.entries()).sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0])));
 }
 
+function chunkArray(items, chunkSize) {
+  const normalizedSize = Math.max(1, Number(chunkSize) || 1);
+  const chunks = [];
+
+  for (let index = 0; index < items.length; index += normalizedSize) {
+    chunks.push(items.slice(index, index + normalizedSize));
+  }
+
+  return chunks;
+}
+
 function clampVerifierConfidence(value) {
   const parsed = Number.parseFloat(value);
   if (!Number.isFinite(parsed)) return 0.5;
@@ -3221,9 +3857,240 @@ function clampVerifierConfidence(value) {
   return Number(parsed.toFixed(2));
 }
 
-function buildProfessionalVerifierCandidates(transactions, reviewMode = PROFESSIONAL_REVIEW_STANDARD) {
+function buildAmountFingerprint(value) {
+  return roundCurrency(value).toFixed(2);
+}
+
+function buildProfessionalVerifierAmountIndex(transactions) {
+  const amountIndex = new Map();
+
+  transactions.forEach((tx, index) => {
+    if (!tx || !Number.isFinite(Number(tx.amount))) return;
+
+    const amountKey = buildAmountFingerprint(tx.amount);
+    if (!amountIndex.has(amountKey)) {
+      amountIndex.set(amountKey, []);
+    }
+
+    amountIndex.get(amountKey).push({
+      index,
+      tx,
+      dateValue: parsePotentialDate(tx.date)?.getTime() || null,
+    });
+  });
+
+  return amountIndex;
+}
+
+function withinDayWindow(dateValueA, dateValueB, maxDays) {
+  if (!Number.isFinite(dateValueA) || !Number.isFinite(dateValueB)) return false;
+  return Math.abs(dateValueA - dateValueB) <= maxDays * 24 * 60 * 60 * 1000;
+}
+
+function buildOffsetExample(matchEntry) {
+  return {
+    date: matchEntry.tx.date,
+    amount: matchEntry.tx.amount,
+    type: matchEntry.tx.type,
+    classification: buildClassificationLabel(matchEntry.tx.plSection, matchEntry.tx.plGroup, matchEntry.tx.plAccount),
+    memo: normalizeDescription(matchEntry.tx.description),
+  };
+}
+
+function buildVerifierInternalChecks(clusterTransactions, amountIndex) {
+  const diagnostics = {
+    refundLikeCount: 0,
+    returnedItemCount: 0,
+    operatingRefundSignalCount: 0,
+    nonOperatingRefundSignalCount: 0,
+    bankFeeCount: 0,
+    transferSignalCount: 0,
+    creditCardPaymentCount: 0,
+    priorDepositMatchCount: 0,
+    priorDeductionMatchCount: 0,
+    likelyReturnedItem: false,
+    likelyVendorRefund: false,
+    sampleOffsetMatches: [],
+  };
+  const seenOffsetKeys = new Set();
+
+  for (const clusterTransaction of clusterTransactions) {
+    if (!clusterTransaction?.tx) continue;
+
+    const { tx, index, dateValue } = clusterTransaction;
+    const upperDescription = tx.description.toUpperCase();
+    const refundLike = isRefundLikeDescription(upperDescription);
+    const returnedItem = isReturnedItemDescription(upperDescription);
+    const operatingRefund = isOperatingVendorRefundCreditDescription(upperDescription);
+    const nonOperatingRefund = isNonOperatingRefundAdjustment(upperDescription);
+    const bankFee = isBankFeeDescription(upperDescription);
+    const creditCardPayment = isCreditCardPaymentDescription(upperDescription);
+    const transferSignal = looksLikeTransferOrBalanceSheet(tx);
+
+    if (refundLike) diagnostics.refundLikeCount += 1;
+    if (returnedItem) diagnostics.returnedItemCount += 1;
+    if (operatingRefund) diagnostics.operatingRefundSignalCount += 1;
+    if (nonOperatingRefund) diagnostics.nonOperatingRefundSignalCount += 1;
+    if (bankFee) diagnostics.bankFeeCount += 1;
+    if (creditCardPayment) diagnostics.creditCardPaymentCount += 1;
+    if (transferSignal) diagnostics.transferSignalCount += 1;
+
+    if (!refundLike && !returnedItem) continue;
+
+    const amountKey = buildAmountFingerprint(tx.amount);
+    const matches = amountIndex.get(amountKey) || [];
+    for (const matchEntry of matches) {
+      if (matchEntry.index === index) continue;
+      if (!withinDayWindow(dateValue, matchEntry.dateValue, returnedItem ? 21 : 180)) continue;
+      if (matchEntry.dateValue != null && dateValue != null && matchEntry.dateValue > dateValue) continue;
+
+      if (returnedItem && matchEntry.tx.type === 'deposit') {
+        diagnostics.priorDepositMatchCount += 1;
+      } else if (refundLike && tx.type === 'deposit' && matchEntry.tx.type === 'deduction') {
+        diagnostics.priorDeductionMatchCount += 1;
+      } else {
+        continue;
+      }
+
+      const sampleKey = `${matchEntry.index}:${amountKey}`;
+      if (!seenOffsetKeys.has(sampleKey) && diagnostics.sampleOffsetMatches.length < 3) {
+        diagnostics.sampleOffsetMatches.push(buildOffsetExample(matchEntry));
+        seenOffsetKeys.add(sampleKey);
+      }
+    }
+  }
+
+  diagnostics.likelyReturnedItem = diagnostics.returnedItemCount > 0 && diagnostics.priorDepositMatchCount > 0;
+  diagnostics.likelyVendorRefund = diagnostics.refundLikeCount > 0 && diagnostics.priorDeductionMatchCount > 0;
+
+  return diagnostics;
+}
+
+function buildVerifierCandidateToolContext(candidate, clusterTransactions, amountIndex, companyProfile = null) {
+  const historyLookup = buildClassificationHistoryLookup(candidate, companyProfile);
+  const diagnostics = buildVerifierInternalChecks(clusterTransactions, amountIndex);
+  return {
+    historyLookup,
+    diagnostics,
+  };
+}
+
+function isIgnoreLikeClassification(classification = null) {
+  return normalizeWhitespace(classification?.section) === 'Ignore';
+}
+
+function isIncomeLikeClassification(classification = null) {
+  const section = normalizeWhitespace(classification?.section);
+  return section === 'Income' || section === 'Other Income';
+}
+
+function isBankChargeClassification(classification = null) {
+  return buildClassificationLabel(
+    classification?.section,
+    classification?.group,
+    classification?.account,
+  ) === 'Expenses / Bank Charge service / Bank Charge service';
+}
+
+function buildVerifierStabilityGuard(
+  candidate,
+  classification,
+  confidence,
+  modelNeedsUserConfirmation = false,
+  reviewMode = PROFESSIONAL_REVIEW_STANDARD,
+) {
+  const suggestedLabel = buildClassificationLabel(classification?.section, classification?.group, classification?.account);
+  const currentLabel = candidate?.currentClassificationLabel || '';
+  const historyLookup = candidate?.toolContext?.historyLookup || {};
+  const diagnostics = candidate?.toolContext?.diagnostics || {};
+  const stableHistoryLabel = historyLookup.stablePriorClassification
+    ? normalizeWhitespace(historyLookup.dominantClassificationLabel)
+    : '';
+  const currentMatchesHistory = Boolean(stableHistoryLabel && currentLabel === stableHistoryLabel);
+  const suggestedMatchesHistory = Boolean(stableHistoryLabel && suggestedLabel === stableHistoryLabel);
+  const userAnchoredHistory = (historyLookup.manualReviewCount || 0) > 0 || (historyLookup.savedRuleCount || 0) > 0;
+  const bankFeeOnly = candidate?.transactionCount > 0
+    && diagnostics.bankFeeCount > 0
+    && diagnostics.bankFeeCount === candidate.transactionCount;
+  const transferLikeCluster = diagnostics.transferSignalCount > 0 || diagnostics.creditCardPaymentCount > 0;
+  const refundLikeCluster = diagnostics.likelyReturnedItem
+    || diagnostics.likelyVendorRefund
+    || diagnostics.returnedItemCount > 0
+    || diagnostics.refundLikeCount > 0;
+  const notes = [];
+  let suppressSuggestion = false;
+  let forceUserConfirmation = false;
+
+  if (stableHistoryLabel && suggestedLabel !== stableHistoryLabel && currentMatchesHistory) {
+    suppressSuggestion = true;
+    notes.push(`Stable prior company history already supports ${stableHistoryLabel}, so the conflicting remap was suppressed.`);
+  } else if (stableHistoryLabel && suggestedLabel !== stableHistoryLabel && (userAnchoredHistory || transferLikeCluster || refundLikeCluster)) {
+    forceUserConfirmation = true;
+    notes.push(`Stable prior company history supports ${stableHistoryLabel}, so this conflicting remap now needs confirmation.`);
+  }
+
+  if (!suppressSuggestion && bankFeeOnly && !isBankChargeClassification(classification) && !isIgnoreLikeClassification(classification)) {
+    if (currentMatchesHistory || isBankChargeClassification(candidate?.currentClassification)) {
+      suppressSuggestion = true;
+      notes.push('Every transaction in this cluster looks like a bank fee, so the non-fee remap was suppressed.');
+    } else {
+      forceUserConfirmation = true;
+      notes.push('Every transaction in this cluster looks like a bank fee, so the remap needs confirmation.');
+    }
+  }
+
+  if (!suppressSuggestion && diagnostics.likelyReturnedItem && isIncomeLikeClassification(classification)) {
+    forceUserConfirmation = true;
+    notes.push('A returned-item match was found against a prior deposit, so this income-like remap was held for review.');
+  }
+
+  if (
+    !suppressSuggestion
+    && diagnostics.likelyVendorRefund
+    && isIncomeLikeClassification(classification)
+    && classification?.id !== 'other_income_refunds'
+  ) {
+    forceUserConfirmation = true;
+    notes.push('A prior deduction matched this refund-like cluster, so this income remap was held for review.');
+  }
+
+  if (
+    !suppressSuggestion
+    && transferLikeCluster
+    && !isIgnoreLikeClassification(classification)
+    && suggestedLabel !== currentLabel
+  ) {
+    if (currentMatchesHistory) {
+      suppressSuggestion = true;
+      notes.push('Transfer-style or credit-card-payment wording is still present, so the remap was suppressed until a clearer signal appears.');
+      forceUserConfirmation = false;
+    } else if (!modelNeedsUserConfirmation || confidence >= OPENAI_VERIFIER_AUTO_APPLY_CONFIDENCE) {
+      forceUserConfirmation = true;
+      notes.push('Transfer-style or credit-card-payment wording is still present, so this non-transfer remap needs confirmation.');
+    }
+  }
+
+  return {
+    suppressSuggestion,
+    forceUserConfirmation,
+    notes,
+    stableHistoryLabel,
+    currentMatchesHistory,
+    suggestedMatchesHistory,
+    usedHistoryAnchor: Boolean(stableHistoryLabel),
+    usedDiagnosticAnchor: Boolean(
+      bankFeeOnly
+      || transferLikeCluster
+      || diagnostics.likelyReturnedItem
+      || diagnostics.likelyVendorRefund,
+    ),
+  };
+}
+
+function buildProfessionalVerifierCandidates(transactions, reviewMode = PROFESSIONAL_REVIEW_STANDARD, companyProfile = null) {
   const strictReview = isStrictProfessionalReviewMode(reviewMode);
   const clusters = new Map();
+  const amountIndex = buildProfessionalVerifierAmountIndex(transactions);
 
   transactions.forEach((tx, index) => {
     if (!tx || tx.plSection === 'Ignore') return;
@@ -3273,27 +4140,49 @@ function buildProfessionalVerifierCandidates(transactions, reviewMode = PROFESSI
 
   return Array.from(clusters.values())
     .map((cluster) => {
+      const clusterTransactions = cluster.transactionIndexes
+        .map((transactionIndex) => {
+          const tx = transactions[transactionIndex];
+          if (!tx) return null;
+          return {
+            index: transactionIndex,
+            tx,
+            dateValue: parsePotentialDate(tx.date)?.getTime() || null,
+          };
+        })
+        .filter(Boolean);
       const currentClassificationOptions = getSortedCountEntries(cluster.currentClassifications);
       const scheduleCategoryOptions = getSortedCountEntries(cluster.scheduleCategories);
       const typeOptions = getSortedCountEntries(cluster.types);
       const dominantClassificationLabel = currentClassificationOptions[0]?.[0] || 'Unassigned / Unassigned / Unassigned';
       const [currentSection = 'Expenses', currentGroup = 'Other Expense', currentAccount = currentGroup] = dominantClassificationLabel.split(' / ');
       const dominantType = typeOptions[0]?.[0] || 'deduction';
+      const toolCandidate = {
+        key: cluster.key,
+        dominantType,
+        currentClassificationLabel: dominantClassificationLabel,
+      };
+      const toolContext = buildVerifierCandidateToolContext(toolCandidate, clusterTransactions, amountIndex, companyProfile);
       const hasClassificationConflict = currentClassificationOptions.length > 1;
       const hasScheduleCategoryConflict = scheduleCategoryOptions.length > 1;
       const highImpact = cluster.totalAmount >= OPENAI_VERIFIER_MIN_CLUSTER_AMOUNT;
       const hasTransferStyleQuestion = cluster.baseSignalTypes.has('transfer_review') || cluster.baseSignalTypes.has('refund_review');
+      const hasRefundOrReturnedSignal = toolContext.diagnostics.refundLikeCount > 0 || toolContext.diagnostics.returnedItemCount > 0;
       const allForcedRule = cluster.transactionCount > 0 && cluster.forcedRuleCount === cluster.transactionCount;
       const allSavedRule = cluster.transactionCount > 0 && cluster.savedRuleCount === cluster.transactionCount;
       const hasLegalLikeSignal = cluster.legalSignalCount > 0;
       const strictMaterialCluster = strictReview && cluster.totalAmount >= STRICT_REVIEW_MIN_CLUSTER_AMOUNT;
-      const shouldVerify = !hasTransferStyleQuestion && !allForcedRule && !allSavedRule && (
+      const hasStableHistoricalConflict = toolContext.historyLookup.conflictingPriorClassification;
+      const shouldVerify = !allForcedRule && !allSavedRule && (!hasTransferStyleQuestion || hasRefundOrReturnedSignal || hasStableHistoricalConflict) && (
         cluster.genericCount > 0
         || hasClassificationConflict
         || hasScheduleCategoryConflict
         || cluster.baseSignalTypes.has('category_conflict')
         || cluster.baseSignalTypes.has('generic_review')
         || (hasLegalLikeSignal && cluster.totalAmount >= 250)
+        || hasStableHistoricalConflict
+        || toolContext.diagnostics.likelyReturnedItem
+        || toolContext.diagnostics.likelyVendorRefund
         || highImpact
         || (cluster.priorityGroupCount > 0 && cluster.totalAmount >= 250)
         || strictMaterialCluster
@@ -3304,6 +4193,9 @@ function buildProfessionalVerifierCandidates(transactions, reviewMode = PROFESSI
         + (cluster.genericCount > 0 ? 2500 : 0)
         + (hasScheduleCategoryConflict ? 2000 : 0)
         + (hasLegalLikeSignal ? 1800 : 0)
+        + (hasStableHistoricalConflict ? 1600 : 0)
+        + (toolContext.diagnostics.likelyReturnedItem ? 1400 : 0)
+        + (toolContext.diagnostics.likelyVendorRefund ? 1300 : 0)
         + (cluster.priorityGroupCount > 0 ? 1500 : 0)
         + (highImpact ? 1000 : 0)
         + (strictMaterialCluster ? 900 : 0)
@@ -3333,6 +4225,7 @@ function buildProfessionalVerifierCandidates(transactions, reviewMode = PROFESSI
         hasLegalLikeSignal,
         highImpact,
         strictMaterialCluster,
+        toolContext,
         shouldVerify,
         priorityScore,
       };
@@ -3342,7 +4235,12 @@ function buildProfessionalVerifierCandidates(transactions, reviewMode = PROFESSI
     .slice(0, MAX_OPENAI_VERIFIER_CLUSTERS);
 }
 
-async function requestProfessionalVerifierDecisions(candidates, companyProfile = null) {
+async function requestProfessionalVerifierBatchDecisions(
+  candidates,
+  companyProfile = null,
+  batchIndex = 0,
+  batchCount = 1,
+) {
   const configuredClassifications = getConfiguredProfessionalVerifierClassifications(companyProfile);
   const schema = {
     type: 'object',
@@ -3374,14 +4272,22 @@ async function requestProfessionalVerifierDecisions(candidates, companyProfile =
 
   const prompt = [
     'You are a senior bookkeeper performing a second-pass category review for bank-statement clusters before a professional cash-basis P&L is built.',
+    batchCount > 1
+      ? `This is verifier batch ${batchIndex + 1} of ${batchCount}. Only return decisions for the clusters shown in this batch.`
+      : 'Return decisions only for the clusters shown below.',
     'Choose exactly one classificationId from the allowed chart of accounts for each cluster.',
     'Do not invent new accounts, sections, or ids.',
+    'You also receive INTERNAL_TOOL_RESULTS from deterministic bookkeeping helpers. Treat these as evidence, not as suggestions from another model.',
     'Use ignore_transfer for internal transfers, credit-card payments, balance-sheet activity, owner movements, or loan activity.',
     'Trust-company wires, attorney payments, law firms, retainers, and professional advisory/consulting vendors can still be Legal & Professional Fees even when the bank memo contains wire or transfer wording.',
     'Use expenses_ask_my_accountant when the item is business-related but still unclear or should stay in a suspense bucket.',
     'Use cogs_subcontractors for contractors or vendors paid to deliver client work.',
     'Use cogs_advertising_lead_generation for lead-gen and direct-response marketing payout rails such as Steven/ST vendor payments.',
     'Schedule C category is a hint, not the final source of truth.',
+    'If INTERNAL_TOOL_RESULTS.historyLookup shows a stable prior company classification, prefer it unless the current evidence clearly contradicts it.',
+    'If INTERNAL_TOOL_RESULTS.diagnostics.likelyReturnedItem is true, do not classify the cluster as new sales or other income.',
+    'If INTERNAL_TOOL_RESULTS.diagnostics.bankFeeCount equals the cluster transactionCount, prefer Bank Charge service instead of a transfer classification.',
+    'If INTERNAL_TOOL_RESULTS.diagnostics.likelyVendorRefund is true, prefer a refund/credit treatment over new sales unless there is strong contrary evidence.',
     'If the evidence is mixed, the amount is large, or the current guess could reasonably be wrong, set needsUserConfirmation to true.',
     'Keep reasons short and specific.',
     '',
@@ -3400,6 +4306,10 @@ async function requestProfessionalVerifierDecisions(candidates, companyProfile =
       baseSignalTypes: cluster.baseSignalTypes,
       sourceFiles: cluster.sourceFiles,
       sampleDescriptions: cluster.sampleDescriptions,
+      internalToolResults: {
+        historyLookup: cluster.toolContext?.historyLookup || null,
+        diagnostics: cluster.toolContext?.diagnostics || null,
+      },
       flags: {
         hasClassificationConflict: cluster.hasClassificationConflict,
         hasScheduleCategoryConflict: cluster.hasScheduleCategoryConflict,
@@ -3430,6 +4340,37 @@ async function requestProfessionalVerifierDecisions(candidates, companyProfile =
   return Array.isArray(payload?.clusterDecisions) ? payload.clusterDecisions : [];
 }
 
+async function requestProfessionalVerifierDecisions(candidates, companyProfile = null) {
+  const batches = chunkArray(candidates, OPENAI_VERIFIER_BATCH_SIZE);
+  const decisions = [];
+  let partialFailure = null;
+
+  for (const [batchIndex, batchCandidates] of batches.entries()) {
+    try {
+      const batchDecisions = await requestProfessionalVerifierBatchDecisions(
+        batchCandidates,
+        companyProfile,
+        batchIndex,
+        batches.length,
+      );
+      decisions.push(...batchDecisions);
+    } catch (err) {
+      if (decisions.length === 0) {
+        throw err;
+      }
+
+      partialFailure = `OpenAI verifier batch ${batchIndex + 1}/${batches.length} failed after ${decisions.length.toLocaleString()} decision(s) were collected: ${err.message}`;
+      break;
+    }
+  }
+
+  return {
+    decisions,
+    batchCount: batches.length,
+    partialFailure,
+  };
+}
+
 async function runProfessionalOpenAiVerifier(
   transactions,
   reviewMode = PROFESSIONAL_REVIEW_STANDARD,
@@ -3441,9 +4382,14 @@ async function runProfessionalOpenAiVerifier(
     model: openai ? OPENAI_MODEL : null,
     reviewMode: normalizeProfessionalReviewMode(reviewMode),
     strictReview,
+    batchCount: 0,
     evaluatedClusterCount: 0,
+    historyBackedClusterCount: 0,
+    diagnosticClusterCount: 0,
     autoAppliedClusterCount: 0,
     reviewSuggestedClusterCount: 0,
+    stabilitySuppressedClusterCount: 0,
+    stabilityHeldClusterCount: 0,
     warning: null,
     reviewSuggestions: [],
   };
@@ -3452,8 +4398,22 @@ async function runProfessionalOpenAiVerifier(
     return summary;
   }
 
-  const candidates = buildProfessionalVerifierCandidates(transactions, reviewMode);
+  const candidates = buildProfessionalVerifierCandidates(transactions, reviewMode, companyProfile);
   summary.evaluatedClusterCount = candidates.length;
+  summary.historyBackedClusterCount = candidates.filter((candidate) => candidate.toolContext?.historyLookup?.seenBefore).length;
+  summary.diagnosticClusterCount = candidates.filter((candidate) => {
+    const diagnostics = candidate.toolContext?.diagnostics;
+    return Boolean(
+      diagnostics
+      && (
+        diagnostics.refundLikeCount > 0
+        || diagnostics.returnedItemCount > 0
+        || diagnostics.bankFeeCount > 0
+        || diagnostics.likelyReturnedItem
+        || diagnostics.likelyVendorRefund
+      )
+    );
+  }).length;
 
   if (candidates.length === 0) {
     return summary;
@@ -3462,7 +4422,12 @@ async function runProfessionalOpenAiVerifier(
   const candidateByKey = new Map(candidates.map((candidate) => [candidate.key, candidate]));
 
   try {
-    const decisions = await requestProfessionalVerifierDecisions(candidates, companyProfile);
+    const verifierResult = await requestProfessionalVerifierDecisions(candidates, companyProfile);
+    const decisions = Array.isArray(verifierResult?.decisions) ? verifierResult.decisions : [];
+    summary.batchCount = Number(verifierResult?.batchCount) || 0;
+    if (verifierResult?.partialFailure) {
+      summary.warning = verifierResult.partialFailure;
+    }
 
     for (const rawDecision of decisions) {
       const clusterKey = normalizeWhitespace(rawDecision?.clusterKey);
@@ -3484,10 +4449,28 @@ async function runProfessionalOpenAiVerifier(
         .slice(0, 2);
       const suggestedLabel = buildClassificationLabel(classification.section, classification.group, classification.account);
       const currentLabel = candidate.currentClassificationLabel;
-      const shouldAskUser = strictReview
-        || Boolean(rawDecision?.needsUserConfirmation)
-        || confidence < OPENAI_VERIFIER_AUTO_APPLY_CONFIDENCE;
-      const shouldAutoApply = !strictReview && !shouldAskUser && suggestedLabel !== currentLabel;
+      const modelNeedsUserConfirmation = Boolean(rawDecision?.needsUserConfirmation);
+      const stabilityGuard = buildVerifierStabilityGuard(
+        candidate,
+        classification,
+        confidence,
+        modelNeedsUserConfirmation,
+        reviewMode,
+      );
+      const shouldAskUser = !stabilityGuard.suppressSuggestion && (
+        strictReview
+        || modelNeedsUserConfirmation
+        || confidence < OPENAI_VERIFIER_AUTO_APPLY_CONFIDENCE
+        || stabilityGuard.forceUserConfirmation
+      );
+      const shouldAutoApply = !strictReview && !shouldAskUser && !stabilityGuard.suppressSuggestion && suggestedLabel !== currentLabel;
+      const stabilitySuppressed = stabilityGuard.suppressSuggestion;
+      const stabilityHeld = !stabilitySuppressed && stabilityGuard.forceUserConfirmation;
+      if (stabilitySuppressed) {
+        summary.stabilitySuppressedClusterCount += 1;
+      } else if (stabilityHeld) {
+        summary.stabilityHeldClusterCount += 1;
+      }
 
       for (const transactionIndex of candidate.transactionIndexes) {
         const transaction = transactions[transactionIndex];
@@ -3509,6 +4492,9 @@ async function runProfessionalOpenAiVerifier(
           verifierAlternatives: alternatives,
           verifierNeedsUserConfirmation: shouldAskUser,
           verifierAutoApplied: shouldAutoApply,
+          verifierStabilitySuppressed: stabilitySuppressed,
+          verifierStabilityHeld: stabilityHeld,
+          verifierStabilityNotes: stabilityGuard.notes,
         };
 
         if (shouldAutoApply) {
@@ -3543,6 +4529,10 @@ async function runProfessionalOpenAiVerifier(
           sampleDescriptions: candidate.sampleDescriptions,
           sourceFiles: candidate.sourceFiles,
           strictConfirmationOnly: strictReview && suggestedLabel === currentLabel,
+          toolContext: candidate.toolContext,
+          stabilityNotes: stabilityGuard.notes,
+          stabilitySuppressed,
+          stabilityHeld,
         });
       }
     }
@@ -3627,6 +4617,10 @@ function buildProfessionalVerifierReviewQuestions(
       );
     }
 
+    const stabilityNoteText = Array.isArray(suggestion.stabilityNotes) && suggestion.stabilityNotes.length > 0
+      ? ` ${suggestion.stabilityNotes.join(' ')}`
+      : '';
+
     return {
       id: `review_verifier_${index + 1}`,
       type: 'verifier_category_review',
@@ -3640,10 +4634,10 @@ function buildProfessionalVerifierReviewQuestions(
         ? strictReview
           ? `Strict review is on, so this material or ambiguous cluster still needs your confirmation even though OpenAI agrees with the current professional classification of ${suggestion.currentClassificationLabel}.`
           : `OpenAI agrees with the current professional classification of ${suggestion.currentClassificationLabel}, but this cluster still needs confirmation.`
-        : `OpenAI reviewed this cluster against the closed professional chart of accounts and suggests ${suggestion.suggestedClassificationLabel}.`,
+        : `OpenAI reviewed this cluster against the closed professional chart of accounts and suggests ${suggestion.suggestedClassificationLabel}.${stabilityNoteText}`,
       reason: suggestion.reason
-        ? `${Math.round(suggestion.confidence * 100)}% confidence. ${suggestion.reason}`
-        : `${Math.round(suggestion.confidence * 100)}% confidence from the second-pass verifier.`,
+        ? `${Math.round(suggestion.confidence * 100)}% confidence. ${suggestion.reason}${stabilityNoteText}`
+        : `${Math.round(suggestion.confidence * 100)}% confidence from the second-pass verifier.${stabilityNoteText}`,
       currentClassification: suggestion.currentClassificationLabel,
       suggestedClassification: suggestion.suggestedClassificationLabel,
       verifierConfidence: suggestion.confidence,
@@ -3714,9 +4708,108 @@ function buildProfessionalReviewQuestions(transactions, reviewMode = PROFESSIONA
     .slice(0, getProfessionalReviewQuestionLimit(reviewMode));
 }
 
+function buildProfessionalCoverageReviewQuestions(
+  transactions,
+  statementMetas = [],
+  reviewMode = PROFESSIONAL_REVIEW_STANDARD,
+) {
+  if (!isStrictProfessionalReviewMode(reviewMode)) {
+    return [];
+  }
+
+  const coverageAudit = buildStatementCoverageAudit(statementMetas);
+  const accountSignals = Array.isArray(coverageAudit.accountSignals) ? coverageAudit.accountSignals : [];
+  if (accountSignals.length === 0) {
+    return [];
+  }
+
+  const sourceAccountBuckets = new Map();
+  transactions.forEach((tx, index) => {
+    const sourceMeta = inferSourceAccountMeta(tx.sourceFile, tx.sourceStatementMeta);
+    const sourceAccountKey = sourceMeta.key || normalizeFingerprintSource(sourceMeta.label || tx.sourceFile || 'Uploaded Statement');
+    if (!sourceAccountKey) return;
+
+    if (!sourceAccountBuckets.has(sourceAccountKey)) {
+      sourceAccountBuckets.set(sourceAccountKey, {
+        transactionIndexes: [],
+        transactionCount: 0,
+        totalAmount: 0,
+        sampleDescriptions: new Set(),
+        sourceFiles: new Set(),
+      });
+    }
+
+    const bucket = sourceAccountBuckets.get(sourceAccountKey);
+    bucket.transactionIndexes.push(index);
+    bucket.transactionCount += 1;
+    bucket.totalAmount = roundCurrency(bucket.totalAmount + (Number(tx.amount) || 0));
+    if (tx.description) bucket.sampleDescriptions.add(tx.description);
+    if (tx.sourceFile) bucket.sourceFiles.add(tx.sourceFile);
+  });
+
+  return accountSignals
+    .map((signal, index) => {
+      const transactionBucket = sourceAccountBuckets.get(signal.sourceAccountKey);
+      if (!transactionBucket || transactionBucket.transactionIndexes.length === 0) {
+        return null;
+      }
+
+      const missingMonthSummary = summarizeCoverageMonths(
+        signal.missingMonthsInsideAccount?.length > 0
+          ? signal.missingMonthsInsideAccount
+          : signal.missingMonthsRelativeToPackage,
+      );
+      const coverageRatio = signal.expectedMonthCount > 0
+        ? `${signal.coveredMonthCount.toLocaleString()}/${signal.expectedMonthCount.toLocaleString()} package months`
+        : `${signal.coveredMonthCount.toLocaleString()} covered month(s)`;
+      const prompt = signal.detail
+        ? `Strict review flagged this source account as potentially incomplete. ${signal.detail}`
+        : `Strict review flagged this source account as potentially incomplete based on the extracted statement periods.`;
+      const reason = missingMonthSummary
+        ? `Coverage: ${coverageRatio}. Missing months: ${missingMonthSummary}.`
+        : `Coverage: ${coverageRatio}.`;
+
+      return {
+        id: `review_coverage_${index + 1}`,
+        type: 'coverage_review',
+        priority: signal.severity === 'warning' ? 1.25 : 1.75,
+        title: `Can we finalize the P&L with partial coverage for ${signal.sourceAccountLabel}?`,
+        prompt,
+        reason,
+        options: [
+          createReviewOption(
+            'acknowledge_continue',
+            'Proceed with current package',
+            'Keep this source account in the current professional P&L and continue with a completeness warning.',
+            null,
+            { recommended: true, acknowledgementOnly: true },
+          ),
+          createReviewOption(
+            'exclude_source_account',
+            'Exclude this source account for now',
+            'Remove this source account from the current professional P&L until the missing statements are uploaded.',
+            { plSection: 'Ignore', plGroup: 'Coverage Hold', plAccount: 'Missing Statement Coverage' },
+          ),
+        ],
+        transactionIndexes: transactionBucket.transactionIndexes,
+        transactionCount: transactionBucket.transactionCount,
+        totalAmount: roundCurrency(transactionBucket.totalAmount),
+        sampleDescriptions: Array.from(transactionBucket.sampleDescriptions).slice(0, 3),
+        sourceFiles: Array.from(transactionBucket.sourceFiles),
+        clusterLabel: signal.sourceAccountLabel,
+        currentClassification: 'Partial source coverage warning',
+        suggestedClassification: '',
+        verifierConfidence: null,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.priority - b.priority || b.totalAmount - a.totalAmount);
+}
+
 function getPublicReviewQuestion(question) {
   return {
     id: question.id,
+    type: question.type,
     title: question.title,
     clusterLabel: question.clusterLabel,
     prompt: question.prompt,
@@ -3747,13 +4840,22 @@ async function buildProfessionalReviewState(
   const normalizedReviewMode = normalizeProfessionalReviewMode(reviewMode);
   const strictReview = isStrictProfessionalReviewMode(normalizedReviewMode);
   const normalizedTransactions = transactions.map(normalizeProfitAndLossTransaction);
+  const normalizedStatementMetas = buildReportStatementMetas(statementMetas);
+  const coverageQuestions = buildProfessionalCoverageReviewQuestions(
+    normalizedTransactions,
+    normalizedStatementMetas,
+    normalizedReviewMode,
+  );
   const persistedRuleSummary = applyPersistedReviewRules(normalizedTransactions, companyProfile);
   const verifierSummary = await runProfessionalOpenAiVerifier(normalizedTransactions, normalizedReviewMode, companyProfile);
   const verifierQuestions = buildProfessionalVerifierReviewQuestions(verifierSummary, normalizedReviewMode, companyProfile);
   const verifierQuestionTransactionIndexes = new Set(verifierQuestions.flatMap((question) => question.transactionIndexes));
-  const baseQuestions = buildProfessionalReviewQuestions(normalizedTransactions, normalizedReviewMode)
+  const baseQuestions = [
+    ...coverageQuestions,
+    ...buildProfessionalReviewQuestions(normalizedTransactions, normalizedReviewMode)
+  ]
     .filter((question) => {
-      if (!['generic_review', 'category_conflict'].includes(question.type)) {
+      if (question.type === 'coverage_review') {
         return true;
       }
 
@@ -3770,8 +4872,8 @@ async function buildProfessionalReviewState(
   const warning = warningParts.length > 0 ? warningParts.join(' ') : null;
   const verifierSummaryText = verifierSummary.enabled && verifierSummary.evaluatedClusterCount > 0
     ? strictReview
-      ? ` OpenAI reviewed ${verifierSummary.evaluatedClusterCount.toLocaleString()} high-impact or material cluster(s) and held ${verifierSummary.reviewSuggestedClusterCount.toLocaleString()} for your confirmation.`
-      : ` OpenAI reviewed ${verifierSummary.evaluatedClusterCount.toLocaleString()} high-impact cluster(s) and auto-applied ${verifierSummary.autoAppliedClusterCount.toLocaleString()} confident mapping(s).`
+      ? ` OpenAI reviewed ${verifierSummary.evaluatedClusterCount.toLocaleString()} high-impact or material cluster(s), using ${verifierSummary.historyBackedClusterCount.toLocaleString()} historical lookup(s) and ${verifierSummary.diagnosticClusterCount.toLocaleString()} refund/returned-item diagnostic check(s), suppressed ${verifierSummary.stabilitySuppressedClusterCount.toLocaleString()} unstable remap(s), and held ${verifierSummary.reviewSuggestedClusterCount.toLocaleString()} for your confirmation.`
+      : ` OpenAI reviewed ${verifierSummary.evaluatedClusterCount.toLocaleString()} high-impact cluster(s), using ${verifierSummary.historyBackedClusterCount.toLocaleString()} historical lookup(s) and ${verifierSummary.diagnosticClusterCount.toLocaleString()} refund/returned-item diagnostic check(s), suppressed ${verifierSummary.stabilitySuppressedClusterCount.toLocaleString()} unstable remap(s), auto-applied ${verifierSummary.autoAppliedClusterCount.toLocaleString()} confident mapping(s), and held ${verifierSummary.stabilityHeldClusterCount.toLocaleString()} drift-prone remap(s) for review.`
     : '';
   const persistedRuleText = persistedRuleSummary.appliedRuleCount > 0
     ? ` Saved review rules auto-applied ${persistedRuleSummary.appliedRuleCount.toLocaleString()} cluster decision(s) before review.`
@@ -3779,12 +4881,15 @@ async function buildProfessionalReviewState(
   const strictReviewText = strictReview
     ? ' Strict review is on, so the professional P&L will pause for any material or unclear cluster instead of auto-applying verifier remaps.'
     : '';
+  const coverageQuestionText = coverageQuestions.length > 0
+    ? ` Coverage review added ${coverageQuestions.length.toLocaleString()} acknowledgement question(s) for source accounts that look partial or incomplete.`
+    : '';
 
   return {
     companyId: companyProfile?.id || null,
     transactions: normalizedTransactions,
     reviewMode: normalizedReviewMode,
-    statementMetas: buildReportStatementMetas(statementMetas),
+    statementMetas: normalizedStatementMetas,
     persistedRuleSummary,
     verifierSummary,
     questions,
@@ -3793,7 +4898,7 @@ async function buildProfessionalReviewState(
       companyName: companyProfile?.name || '',
       reviewMode: normalizedReviewMode,
       totalQuestions: questions.length,
-      summary: `We found ${questions.length} clarification question(s) before finalizing the professional P&L.${strictReviewText}${persistedRuleText}${verifierSummaryText}`,
+      summary: `We found ${questions.length} clarification question(s) before finalizing the professional P&L.${strictReviewText}${coverageQuestionText}${persistedRuleText}${verifierSummaryText}`,
       warning,
       questions: questions.map(getPublicReviewQuestion),
     },
@@ -3830,23 +4935,25 @@ function applyReviewAnswers(reviewState, answers) {
       throw new Error(`Invalid answer submitted for review question "${question.title}"`);
     }
 
-    for (const transactionIndex of question.transactionIndexes) {
-      const transaction = reviewState.transactions[transactionIndex];
-      if (!transaction) continue;
+    if (selectedOption.override && typeof selectedOption.override === 'object') {
+      for (const transactionIndex of question.transactionIndexes) {
+        const transaction = reviewState.transactions[transactionIndex];
+        if (!transaction) continue;
 
-      transaction.plSection = selectedOption.override.plSection;
-      transaction.plGroup = selectedOption.override.plGroup;
-      transaction.plAccount = selectedOption.override.plAccount;
-      transaction.classificationMeta = {
-        ...transaction.classificationMeta,
-        userReviewApplied: true,
-        finalSection: selectedOption.override.plSection,
-        finalGroup: selectedOption.override.plGroup,
-        finalAccount: selectedOption.override.plAccount,
-      };
+        transaction.plSection = selectedOption.override.plSection;
+        transaction.plGroup = selectedOption.override.plGroup;
+        transaction.plAccount = selectedOption.override.plAccount;
+        transaction.classificationMeta = {
+          ...transaction.classificationMeta,
+          userReviewApplied: true,
+          finalSection: selectedOption.override.plSection,
+          finalGroup: selectedOption.override.plGroup,
+          finalAccount: selectedOption.override.plAccount,
+        };
 
-      if (selectedOption.override.category) {
-        transaction.category = selectedOption.override.category;
+        if (selectedOption.override.category) {
+          transaction.category = selectedOption.override.category;
+        }
       }
     }
 
@@ -4608,9 +5715,21 @@ function buildStatementCoverageAudit(statementMetas = []) {
       const coverageRatioLabel = overallExpectedMonths.length > 0
         ? `${coveredMonths.length.toLocaleString()}/${overallExpectedMonths.length.toLocaleString()} package months covered`
         : `${coveredMonths.length.toLocaleString()} month(s) covered`;
+      const baseSignal = {
+        sourceAccountKey: accountCoverage.key,
+        sourceAccountLabel: accountCoverage.label,
+        sourceAccountType: accountCoverage.accountType || '',
+        statementCount: accountCoverage.statements.length,
+        coverageLabel,
+        coveredMonthCount: coveredMonths.length,
+        expectedMonthCount: expectedMonths.length || overallExpectedMonths.length,
+        missingMonthsInsideAccount,
+        missingMonthsRelativeToPackage,
+      };
 
       if (missingMonthsInsideAccount.length > 0) {
         return {
+          ...baseSignal,
           title: `${accountCoverage.label} may have missing statement months`,
           severity: 'warning',
           badge: 'Gap detected',
@@ -4631,6 +5750,7 @@ function buildStatementCoverageAudit(statementMetas = []) {
         && coveredMonths.length < overallExpectedMonths.length
       ) {
         return {
+          ...baseSignal,
           title: `${accountCoverage.label} only covers part of the uploaded package`,
           severity: 'notice',
           badge: 'Possible partial year',
@@ -4646,6 +5766,7 @@ function buildStatementCoverageAudit(statementMetas = []) {
 
       if (accountCoverage.missingPeriodData > 0) {
         return {
+          ...baseSignal,
           title: `${accountCoverage.label} has statement files with unknown dates`,
           severity: 'warning',
           badge: 'Low visibility',
@@ -4696,6 +5817,7 @@ function buildStatementCoverageAudit(statementMetas = []) {
     missingMonthCount: overallMissingMonths.length,
     statementsMissingPeriodData,
     accountsWithCoverageAlerts,
+    accountSignals: accountAlerts,
     summary: alerts.length > 0
       ? `Coverage analysis flagged ${alerts.length.toLocaleString()} potential completeness issue(s). Some drift may come from missing statement months, not only from categorization.`
       : normalizedStatementMetas.length > 0
@@ -4997,6 +6119,10 @@ function buildProfessionalAudit(
       { label: 'Saved review rules applied', value: counts.savedRuleAppliedCount, format: 'count' },
       { label: 'Rule-based account refinements', value: counts.heuristicRefinementCount, format: 'count' },
       { label: 'OpenAI clusters reviewed', value: verifierSummary?.evaluatedClusterCount || 0, format: 'count' },
+      { label: 'Historical lookups used', value: verifierSummary?.historyBackedClusterCount || 0, format: 'count' },
+      { label: 'Refund / return diagnostics used', value: verifierSummary?.diagnosticClusterCount || 0, format: 'count' },
+      { label: 'Unstable remaps suppressed', value: verifierSummary?.stabilitySuppressedClusterCount || 0, format: 'count' },
+      { label: 'Drift-prone remaps held', value: verifierSummary?.stabilityHeldClusterCount || 0, format: 'count' },
       { label: 'OpenAI auto-mappings applied', value: verifierSummary?.autoAppliedClusterCount || 0, format: 'count' },
       { label: 'User review decisions applied', value: reviewSummary?.resolvedQuestions || 0, format: 'count' },
     ],
@@ -5018,8 +6144,8 @@ function buildProfessionalAudit(
         : 'No local group/account refinement rules were needed after the AI extraction step.',
       verifierSummary?.evaluatedClusterCount
         ? isStrictProfessionalReviewMode(reviewMode)
-          ? `OpenAI reviewed ${verifierSummary.evaluatedClusterCount.toLocaleString()} high-impact or material vendor/memo cluster(s) and held ${verifierSummary.reviewSuggestedClusterCount.toLocaleString()} cluster(s) for human confirmation under strict review.`
-          : `OpenAI reviewed ${verifierSummary.evaluatedClusterCount.toLocaleString()} high-impact vendor or memo cluster(s), auto-applied ${verifierSummary.autoAppliedClusterCount.toLocaleString()} confident mapping(s), and left ${verifierSummary.reviewSuggestedClusterCount.toLocaleString()} cluster(s) for human confirmation.`
+          ? `OpenAI reviewed ${verifierSummary.evaluatedClusterCount.toLocaleString()} high-impact or material vendor/memo cluster(s), using ${(verifierSummary.historyBackedClusterCount || 0).toLocaleString()} historical lookup(s) and ${(verifierSummary.diagnosticClusterCount || 0).toLocaleString()} deterministic refund/returned-item diagnostic check(s), suppressed ${(verifierSummary.stabilitySuppressedClusterCount || 0).toLocaleString()} unstable remap(s), and held ${verifierSummary.reviewSuggestedClusterCount.toLocaleString()} cluster(s) for human confirmation under strict review.`
+          : `OpenAI reviewed ${verifierSummary.evaluatedClusterCount.toLocaleString()} high-impact vendor or memo cluster(s), using ${(verifierSummary.historyBackedClusterCount || 0).toLocaleString()} historical lookup(s) and ${(verifierSummary.diagnosticClusterCount || 0).toLocaleString()} deterministic refund/returned-item diagnostic check(s), suppressed ${(verifierSummary.stabilitySuppressedClusterCount || 0).toLocaleString()} unstable remap(s), auto-applied ${verifierSummary.autoAppliedClusterCount.toLocaleString()} confident mapping(s), and left ${verifierSummary.reviewSuggestedClusterCount.toLocaleString()} cluster(s) for human confirmation.`
         : 'No OpenAI second-pass cluster verification was applied in this professional run.',
       `${counts.transferSignalCount.toLocaleString()} transaction(s) matched transfer or balance-sheet heuristics, and ${excludedTransactions.length.toLocaleString()} total transaction(s) ended up excluded from the final P&L after review and rule application.`,
       reviewSummary?.resolvedQuestions
@@ -5400,6 +6526,7 @@ app.post('/api/review/:id', (req, res) => {
       answers: appliedAnswers,
       savedRuleSummary,
     }, job.reviewState.statementMetas, job.reviewState.verifierSummary, job.reviewState.persistedRuleSummary, job.reviewMode, companyProfile);
+    persistCompanyClassificationHistory(job.companyId, job.reviewState.transactions);
 
     job.data = report;
     job.review = null;
@@ -5523,6 +6650,7 @@ async function processJob(jobId, files, analysisMode, reviewMode = null, company
         reviewState.reviewMode,
         companyProfile,
       );
+      persistCompanyClassificationHistory(job.companyId, reviewState.transactions);
       job.progress = 100;
       job.data = report;
       job.review = null;
