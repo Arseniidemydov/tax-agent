@@ -60,6 +60,11 @@ That means matching or exceeding:
 - `Professional P&L` path
 - AI extraction with Schedule C plus professional account fields
 - Guided review for uncertain professional transactions
+- Accountant review inbox inside the professional flow with:
+  - per-question accountant notes
+  - client follow-up question drafting
+  - explicit `this run only` vs `save for future company runs` decision scope
+  - final audit visibility for both notes and queued client questions
 - Professional audit panel explaining formulas, transfer handling, and review decisions
 - Better transfer clustering for review questions
 - OpenAI second-pass cluster verifier for professional mode
@@ -410,6 +415,23 @@ To fix the annual-run timeout bottleneck:
 - `.env.example` now exposes `OPENAI_VERIFIER_BATCH_SIZE=6`
 - the next annual Flo rerun should answer the real question: does the full-year benchmark now keep the second-pass verifier online instead of timing out at the end of extraction?
 
+### Accountant Inbox Checkpoint
+
+The professional review step now behaves more like an accountant workbench than a raw classifier form:
+
+- each review card can capture an accountant note before the P&L is finalized
+- each review card can draft and queue a client-facing follow-up question
+- review decisions now have explicit scope:
+  - `This run only`
+  - `Save for future company runs`
+- the final audit trail now shows:
+  - which answer was chosen
+  - whether it was run-only or reusable
+  - any accountant note
+  - the queued client follow-up question, when one was created
+
+This is an important bridge between the model layer and actual accountant workflow, because the app can now preserve judgment, not just a bucket choice.
+
 ## Phase 6: Persistence And Reconciliation
 
 ### Outcome
@@ -435,6 +457,10 @@ Move from "AI report generator" to a bookkeeping system.
   - finish validating the new refund / NSF memo normalization against the full annual Flo pack, now with verifier batching enabled
   - refine explicit decision rules for operating refunds vs non-operating/travel refunds
   - broaden the new history-backed remap suppression beyond the March smoke-test families, especially for refund / transfer-like memo variants
+- Build on the new accountant inbox:
+  - add `ask client later` packet/export support so queued client questions can be shared cleanly
+  - allow a review answer to become a saved rule directly from the audit/results view without waiting for the next rerun
+  - consider anchored per-cluster chat only after the structured inbox proves itself
 - Tighten the remaining `Legal & Professional Fees` gap by identifying which trust-company, law-firm, advisory, and settlement-related vendors are still leaking into generic expenses or meals
 - Revisit `Bank Charge service` after the new fee fix, and make sure wire/ACH fees stay inside the P&L without dragging the underlying transfer into it
 - Tighten the `Meals and Entertainment` vs suspense-policy line for clusters like `Chef Shiran`, where the verifier suggests a bookkeeping review but the current statement still keeps the spend as meals

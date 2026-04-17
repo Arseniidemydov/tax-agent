@@ -28,6 +28,7 @@ const resultsTitle = document.getElementById('results-title');
 const resultsSubtitle = document.getElementById('results-subtitle');
 const reviewResultsView = document.getElementById('review-results-view');
 const reviewSummaryNote = document.getElementById('review-summary-note');
+const reviewInboxStats = document.getElementById('review-inbox-stats');
 const reviewQuestionsContainer = document.getElementById('review-questions');
 const reviewSubmitBtn = document.getElementById('review-submit-btn');
 const simpleResultsView = document.getElementById('simple-results-view');
@@ -57,6 +58,8 @@ const pnlAuditCoverage = document.getElementById('pnl-audit-coverage');
 const pnlAuditTransfers = document.getElementById('pnl-audit-transfers');
 const pnlAuditReviewSection = document.getElementById('pnl-audit-review-section');
 const pnlAuditReviewDecisions = document.getElementById('pnl-audit-review-decisions');
+const pnlAuditClientSection = document.getElementById('pnl-audit-client-section');
+const pnlAuditClientQuestions = document.getElementById('pnl-audit-client-questions');
 const quickReportSelect = document.getElementById('quick-report-select');
 const quickReportDownloadBtn = document.getElementById('quick-report-download-btn');
 const quickReportSummary = document.getElementById('quick-report-summary');
@@ -98,6 +101,8 @@ let professionalSettings = null;
 const PROFESSIONAL_REVIEW_STANDARD = 'standard';
 const PROFESSIONAL_REVIEW_STRICT = 'strict';
 const COMPANY_STORAGE_KEY = 'tax-agent.active-company-id';
+const REVIEW_DECISION_SCOPE_RUN_ONLY = 'run_only';
+const REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE = 'save_company_rule';
 
 selectedCompanyId = loadStoredCompanyId();
 
@@ -343,6 +348,7 @@ function setDownloadButtonVisible(isVisible) {
 function resetReviewState() {
   reviewQuestions = [];
   reviewAnswers = {};
+  reviewInboxStats.innerHTML = '';
   reviewQuestionsContainer.innerHTML = '';
   reviewSummaryNote.textContent = 'We found a few transactions that need your input before we finalize the professional P&L.';
   reviewSubmitBtn.disabled = true;
@@ -389,6 +395,12 @@ function buildResultsSubtitle(data) {
   const reviewText = data.reviewSummary?.resolvedQuestions
     ? ` Resolved ${data.reviewSummary.resolvedQuestions.toLocaleString()} review question(s) before finalizing this statement.`
     : '';
+  const clientFollowUpCount = Array.isArray(data.reviewSummary?.answers)
+    ? data.reviewSummary.answers.filter((answer) => answer.needsClientAnswer && normalizeWhitespace(answer.clientQuestion)).length
+    : 0;
+  const clientFollowUpText = clientFollowUpCount > 0
+    ? ` Logged ${clientFollowUpCount.toLocaleString()} client follow-up question(s) for the accountant inbox.`
+    : '';
   const warningText = data.warning ? ` Warning: ${data.warning}` : '';
 
   if (data.mode === 'professional') {
@@ -405,7 +417,7 @@ function buildResultsSubtitle(data) {
     const excludedText = data.excludedCount
       ? ` ${data.excludedCount.toLocaleString()} transaction(s) were excluded from the final professional statement.`
       : ' All extracted transactions were included in the professional statement.';
-    return `Cash-basis professional statement built from ${data.transactionCount.toLocaleString()} extracted transaction(s) using Gemini extraction, local classification rules, and optional OpenAI cluster verification.${companyText}${periodText}${reviewModeText}${excludedText}${verifierText}${reviewText}${warningText}`;
+    return `Cash-basis professional statement built from ${data.transactionCount.toLocaleString()} extracted transaction(s) using Gemini extraction, local classification rules, and optional OpenAI cluster verification.${companyText}${periodText}${reviewModeText}${excludedText}${verifierText}${reviewText}${clientFollowUpText}${warningText}`;
   }
 
   return `Grouped deposits and deductions by description from ${data.transactionCount.toLocaleString()} extracted transaction(s).${companyText}${periodText}${warningText}`;
@@ -510,18 +522,159 @@ function addFiles(files) {
 
 // ─── Review Flow ────────────────────────────────────────────────────────────
 
+function getReviewQuestionCanSaveRule(question = {}) {
+  if (typeof question.canSaveAsRule === 'boolean') {
+    return question.canSaveAsRule;
+  }
+
+  return question.type !== 'coverage_review';
+}
+
+function buildDefaultClientQuestion(question = {}) {
+  const sample = Array.isArray(question.sampleDescriptions) && question.sampleDescriptions.length > 0
+    ? question.sampleDescriptions[0]
+    : question.clusterLabel || question.title || 'this transaction cluster';
+  const options = Array.isArray(question.options)
+    ? question.options.slice(0, 3).map((option) => option.label).filter(Boolean)
+    : [];
+  const optionText = options.length > 0 ? ` Options we are considering: ${options.join(' / ')}.` : '';
+  return `Can you confirm how "${sample}" should be treated in the books?${optionText}`;
+}
+
+function getDefaultReviewDecisionScope(question = {}) {
+  if (
+    question.defaultDecisionScope === REVIEW_DECISION_SCOPE_RUN_ONLY
+    || question.defaultDecisionScope === REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE
+  ) {
+    return question.defaultDecisionScope;
+  }
+
+  return getReviewQuestionCanSaveRule(question)
+    ? REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE
+    : REVIEW_DECISION_SCOPE_RUN_ONLY;
+}
+
+function ensureReviewAnswer(question) {
+  const existing = reviewAnswers[question.id];
+  const defaultClientQuestion = question.clientQuestionSuggestion || buildDefaultClientQuestion(question);
+
+  if (!existing || typeof existing !== 'object') {
+    reviewAnswers[question.id] = {
+      optionKey: '',
+      note: '',
+      needsClientAnswer: false,
+      clientQuestion: defaultClientQuestion,
+      decisionScope: getDefaultReviewDecisionScope(question),
+    };
+    return reviewAnswers[question.id];
+  }
+
+  if (typeof existing.optionKey !== 'string') existing.optionKey = '';
+  if (typeof existing.note !== 'string') existing.note = '';
+  if (typeof existing.needsClientAnswer !== 'boolean') existing.needsClientAnswer = false;
+  if (typeof existing.clientQuestion !== 'string' || !existing.clientQuestion.trim()) existing.clientQuestion = defaultClientQuestion;
+  if (
+    existing.decisionScope !== REVIEW_DECISION_SCOPE_RUN_ONLY
+    && existing.decisionScope !== REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE
+  ) {
+    existing.decisionScope = getDefaultReviewDecisionScope(question);
+  }
+  if (!getReviewQuestionCanSaveRule(question)) {
+    existing.decisionScope = REVIEW_DECISION_SCOPE_RUN_ONLY;
+  }
+
+  return existing;
+}
+
+function getReviewAnsweredCount() {
+  return reviewQuestions.filter((question) => ensureReviewAnswer(question).optionKey).length;
+}
+
+function renderReviewInboxStats() {
+  if (!reviewQuestions.length) {
+    reviewInboxStats.innerHTML = '';
+    return;
+  }
+
+  const answeredCount = getReviewAnsweredCount();
+  const clientFollowUpCount = reviewQuestions.filter((question) => {
+    const answer = ensureReviewAnswer(question);
+    return Boolean(answer.needsClientAnswer && normalizeWhitespace(answer.clientQuestion));
+  }).length;
+  const futureRuleCount = reviewQuestions.filter((question) => {
+    const answer = ensureReviewAnswer(question);
+    return answer.optionKey
+      && getReviewQuestionCanSaveRule(question)
+      && answer.decisionScope === REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE;
+  }).length;
+  const totalImpact = reviewQuestions.reduce((sum, question) => sum + (Number(question.totalAmount) || 0), 0);
+
+  reviewInboxStats.innerHTML = `
+    <div class="review-inbox-stat">
+      <div class="review-inbox-stat-label">Questions</div>
+      <div class="review-inbox-stat-value">${escapeHtml(reviewQuestions.length.toLocaleString())}</div>
+    </div>
+    <div class="review-inbox-stat">
+      <div class="review-inbox-stat-label">Answered</div>
+      <div class="review-inbox-stat-value">${escapeHtml(answeredCount.toLocaleString())}</div>
+    </div>
+    <div class="review-inbox-stat">
+      <div class="review-inbox-stat-label">Client Follow-ups</div>
+      <div class="review-inbox-stat-value">${escapeHtml(clientFollowUpCount.toLocaleString())}</div>
+    </div>
+    <div class="review-inbox-stat">
+      <div class="review-inbox-stat-label">Save as Rules</div>
+      <div class="review-inbox-stat-value">${escapeHtml(futureRuleCount.toLocaleString())}</div>
+    </div>
+    <div class="review-inbox-stat">
+      <div class="review-inbox-stat-label">Impacted Amount</div>
+      <div class="review-inbox-stat-value">${escapeHtml(formatMoney(totalImpact))}</div>
+    </div>
+  `;
+}
+
+function buildReviewImpactPreview(question, answerState) {
+  const selectedOption = Array.isArray(question.options)
+    ? question.options.find((option) => option.key === answerState.optionKey)
+    : null;
+
+  if (!selectedOption) {
+    return 'Choose an option to preview how this decision will affect the final professional P&L.';
+  }
+
+  const transactionText = `${question.transactionCount.toLocaleString()} transaction(s)`;
+  const amountText = formatMoney(question.totalAmount || 0);
+
+  if (!selectedOption.override) {
+    return `Impact preview: ${amountText} across ${transactionText} stays in this run, but the professional report will keep a completeness warning until the missing source coverage is resolved.`;
+  }
+
+  if (selectedOption.override.plSection === 'Ignore') {
+    return `Impact preview: ${amountText} across ${transactionText} will be excluded from the final professional P&L.`;
+  }
+
+  const classification = [selectedOption.override.plSection, selectedOption.override.plGroup, selectedOption.override.plAccount]
+    .filter(Boolean)
+    .join(' / ');
+
+  return `Impact preview: ${amountText} across ${transactionText} will be booked to ${classification}.`;
+}
+
 function updateReviewSubmitButton() {
-  const answeredCount = reviewQuestions.filter((question) => reviewAnswers[question.id]).length;
+  const answeredCount = getReviewAnsweredCount();
   const allAnswered = reviewQuestions.length > 0 && answeredCount === reviewQuestions.length;
 
   reviewSubmitBtn.disabled = !allAnswered;
   reviewSubmitBtn.innerHTML = `<span>${allAnswered ? `Apply ${answeredCount} Answer${answeredCount === 1 ? '' : 's'} & Build P&L` : `Answer ${reviewQuestions.length} Question${reviewQuestions.length === 1 ? '' : 's'} to Continue`}</span>`;
+  renderReviewInboxStats();
 }
 
 function renderReviewQuestions(questions) {
   reviewQuestionsContainer.innerHTML = '';
 
   questions.forEach((question, questionIndex) => {
+    const answerState = ensureReviewAnswer(question);
+    const canSaveRule = getReviewQuestionCanSaveRule(question);
     const card = document.createElement('div');
     card.className = 'review-question-card';
 
@@ -542,10 +695,13 @@ function renderReviewQuestions(questions) {
       ? `Examples: ${escapeHtml(question.sampleDescriptions.join(' | '))}`
       : '';
     const currentClassificationLabel = question.type === 'coverage_review' ? 'Current status' : 'Current guess';
+    const scopeRunOnlyChecked = answerState.decisionScope === REVIEW_DECISION_SCOPE_RUN_ONLY;
+    const scopeSaveRuleChecked = answerState.decisionScope === REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE;
+    const clientQuestionValue = answerState.clientQuestion || question.clientQuestionSuggestion || buildDefaultClientQuestion(question);
 
     const optionsHtml = question.options.map((option) => `
       <label class="review-option">
-        <input type="radio" name="${escapeHtml(question.id)}" value="${escapeHtml(option.key)}" ${reviewAnswers[question.id] === option.key ? 'checked' : ''} />
+        <input type="radio" name="${escapeHtml(question.id)}" value="${escapeHtml(option.key)}" ${answerState.optionKey === option.key ? 'checked' : ''} />
         <span class="review-option-card">
           <span class="review-option-label">${escapeHtml(option.label)}${option.recommended ? ' <span class="review-option-badge">Recommended</span>' : ''}</span>
           <span class="review-option-description">${escapeHtml(option.description)}</span>
@@ -565,18 +721,99 @@ function renderReviewQuestions(questions) {
         <div class="review-meta-chip">${escapeHtml(currentClassificationLabel)}: ${escapeHtml(question.currentClassification)}</div>
         ${suggestedClassification}
         ${verifierConfidence}
-        <div class="review-meta-chip">${escapeHtml(question.reason)}</div>
+        <div class="review-meta-chip">Why asked: ${escapeHtml(question.reason)}</div>
         ${clusterLabel}
         ${sourceFiles}
       </div>
       ${sampleText ? `<div class="review-samples">${sampleText}</div>` : ''}
       <div class="review-options">${optionsHtml}</div>
+      <div class="review-impact-preview">${escapeHtml(buildReviewImpactPreview(question, answerState))}</div>
+      <div class="review-workbench">
+        <div class="review-workbench-header">
+          <div class="review-workbench-title">Accountant workspace</div>
+          <div class="review-workbench-copy">Capture judgment, client follow-up, and whether this decision should teach future runs.</div>
+        </div>
+        <label class="review-field">
+          <span class="review-control-label">Accountant note</span>
+          <textarea class="review-textarea" name="review-note-${escapeHtml(question.id)}" placeholder="Optional note for your future self, reviewer, or final workpapers.">${escapeHtml(answerState.note)}</textarea>
+          <span class="review-field-hint">Notes show up in the audit trail after the statement is finalized.</span>
+        </label>
+        <label class="review-toggle">
+          <input type="checkbox" name="review-needs-client-${escapeHtml(question.id)}" ${answerState.needsClientAnswer ? 'checked' : ''} />
+          <span>Needs a client follow-up question</span>
+        </label>
+        <label class="review-field review-client-question-field" ${answerState.needsClientAnswer ? '' : 'hidden'}>
+          <span class="review-control-label">Draft client question</span>
+          <textarea class="review-textarea review-textarea-client" name="review-client-${escapeHtml(question.id)}" placeholder="Draft a clean client-facing question.">${escapeHtml(clientQuestionValue)}</textarea>
+          <span class="review-field-hint">Keep this short and client-friendly. It will appear in the final follow-up queue.</span>
+        </label>
+        <div class="review-scope-block">
+          <div class="review-control-label">Decision scope</div>
+          <div class="review-scope-options">
+            <label class="review-scope-option ${scopeRunOnlyChecked ? 'active' : ''}">
+              <input type="radio" name="review-scope-${escapeHtml(question.id)}" value="${REVIEW_DECISION_SCOPE_RUN_ONLY}" ${scopeRunOnlyChecked ? 'checked' : ''} />
+              <span>This run only</span>
+            </label>
+            <label class="review-scope-option ${scopeSaveRuleChecked ? 'active' : ''} ${canSaveRule ? '' : 'disabled'}">
+              <input type="radio" name="review-scope-${escapeHtml(question.id)}" value="${REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE}" ${scopeSaveRuleChecked ? 'checked' : ''} ${canSaveRule ? '' : 'disabled'} />
+              <span>Save for future company runs</span>
+            </label>
+          </div>
+          <div class="review-field-hint">${escapeHtml(canSaveRule ? 'Use this when the same vendor or memo cluster should map the same way next time.' : 'Coverage acknowledgements stay in this run only and are not saved as reusable rules.')}</div>
+        </div>
+      </div>
     `;
 
     card.querySelectorAll(`input[name="${CSS.escape(question.id)}"]`).forEach((input) => {
       input.addEventListener('change', () => {
-        reviewAnswers[question.id] = input.value;
+        const nextState = ensureReviewAnswer(question);
+        nextState.optionKey = input.value;
+        card.querySelector('.review-impact-preview').textContent = buildReviewImpactPreview(question, nextState);
         updateReviewSubmitButton();
+      });
+    });
+
+    const noteField = card.querySelector(`textarea[name="review-note-${CSS.escape(question.id)}"]`);
+    if (noteField) {
+      noteField.addEventListener('input', () => {
+        ensureReviewAnswer(question).note = noteField.value;
+      });
+    }
+
+    const needsClientInput = card.querySelector(`input[name="review-needs-client-${CSS.escape(question.id)}"]`);
+    const clientQuestionField = card.querySelector('.review-client-question-field');
+    const clientQuestionInput = card.querySelector(`textarea[name="review-client-${CSS.escape(question.id)}"]`);
+    if (needsClientInput && clientQuestionField) {
+      needsClientInput.addEventListener('change', () => {
+        const nextState = ensureReviewAnswer(question);
+        nextState.needsClientAnswer = needsClientInput.checked;
+        if (nextState.needsClientAnswer && !normalizeWhitespace(nextState.clientQuestion)) {
+          nextState.clientQuestion = question.clientQuestionSuggestion || buildDefaultClientQuestion(question);
+          if (clientQuestionInput) clientQuestionInput.value = nextState.clientQuestion;
+        }
+        clientQuestionField.hidden = !nextState.needsClientAnswer;
+        renderReviewInboxStats();
+      });
+    }
+
+    if (clientQuestionInput) {
+      clientQuestionInput.addEventListener('input', () => {
+        ensureReviewAnswer(question).clientQuestion = clientQuestionInput.value;
+        renderReviewInboxStats();
+      });
+    }
+
+    card.querySelectorAll(`input[name="review-scope-${CSS.escape(question.id)}"]`).forEach((input) => {
+      input.addEventListener('change', () => {
+        const nextState = ensureReviewAnswer(question);
+        nextState.decisionScope = input.value === REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE && canSaveRule
+          ? REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE
+          : REVIEW_DECISION_SCOPE_RUN_ONLY;
+        card.querySelectorAll('.review-scope-option').forEach((element) => {
+          const optionInput = element.querySelector('input');
+          element.classList.toggle('active', Boolean(optionInput?.checked));
+        });
+        renderReviewInboxStats();
       });
     });
 
@@ -596,9 +833,9 @@ function showReview(job) {
   processingSection.style.display = 'none';
 
   resultsModePill.textContent = getModeCopy('professional', job.reviewMode).pill;
-  resultsTitle.textContent = 'Questions Before Final P&L';
+  resultsTitle.textContent = 'Accountant Review Inbox';
   const reviewCompanyText = job.companyName ? ` Active company: ${job.companyName}.` : '';
-  resultsSubtitle.textContent = `${job.review?.summary || 'We need a few answers before we can finalize the professional statement.'}${reviewCompanyText}`;
+  resultsSubtitle.textContent = `${job.review?.summary || 'We need a few answers before we can finalize the professional statement.'} Resolve the accounting calls, leave notes, and queue any client follow-up before we build the final P&L.${reviewCompanyText}`;
 
   const summaryParts = [job.review?.summary || 'We found a few transactions that need your input before we finalize the professional P&L.'];
   if (job.review?.warning) summaryParts.push(job.review.warning);
@@ -606,13 +843,14 @@ function showReview(job) {
 
   reviewQuestions = Array.isArray(job.review?.questions) ? job.review.questions : [];
   reviewAnswers = {};
+  reviewAnswers = Object.fromEntries(reviewQuestions.map((question) => [question.id, ensureReviewAnswer(question)]));
   renderReviewQuestions(reviewQuestions);
 }
 
 async function submitReviewAnswers() {
   if (!currentJobId || reviewQuestions.length === 0) return;
 
-  const unansweredQuestion = reviewQuestions.find((question) => !reviewAnswers[question.id]);
+  const unansweredQuestion = reviewQuestions.find((question) => !ensureReviewAnswer(question).optionKey);
   if (unansweredQuestion) {
     reviewSummaryNote.textContent = `Please answer every question before finalizing the Professional P&L. Still missing: "${unansweredQuestion.title}".`;
     return;
@@ -628,7 +866,11 @@ async function submitReviewAnswers() {
       body: JSON.stringify({
         answers: reviewQuestions.map((question) => ({
           questionId: question.id,
-          optionKey: reviewAnswers[question.id],
+          optionKey: ensureReviewAnswer(question).optionKey,
+          note: ensureReviewAnswer(question).note,
+          needsClientAnswer: ensureReviewAnswer(question).needsClientAnswer,
+          clientQuestion: ensureReviewAnswer(question).clientQuestion,
+          decisionScope: ensureReviewAnswer(question).decisionScope,
         })),
       }),
     });
@@ -1020,6 +1262,7 @@ function renderProfessionalAudit(audit = {}) {
   const coverageAlerts = Array.isArray(audit.coverageAlerts) ? audit.coverageAlerts : [];
   const transferClusters = Array.isArray(audit.transferClusters) ? audit.transferClusters : [];
   const reviewDecisions = Array.isArray(audit.reviewDecisions) ? audit.reviewDecisions : [];
+  const clientQuestions = reviewDecisions.filter((decision) => decision.needsClientAnswer && normalizeWhitespace(decision.clientQuestion));
 
   pnlAuditStats.innerHTML = overviewStats.length > 0
     ? overviewStats.map((item) => `
@@ -1093,11 +1336,34 @@ function renderProfessionalAudit(audit = {}) {
           <div class="audit-decision-title">${escapeHtml(decision.questionTitle)}</div>
           <div class="audit-decision-answer">${escapeHtml(decision.answerLabel)}</div>
         </div>
+        <div class="audit-decision-meta">
+          ${decision.decisionScopeLabel ? `<div class="review-meta-chip">${escapeHtml(decision.decisionScopeLabel)}</div>` : ''}
+          ${decision.needsClientAnswer ? '<div class="review-meta-chip">Client follow-up queued</div>' : ''}
+        </div>
+        ${decision.note ? `<div class="audit-decision-copy">Accountant note: ${escapeHtml(decision.note)}</div>` : ''}
+        ${decision.clientQuestion ? `<div class="audit-decision-copy">Client question: ${escapeHtml(decision.clientQuestion)}</div>` : ''}
       </div>
     `).join('');
   } else {
     pnlAuditReviewSection.style.display = 'none';
     pnlAuditReviewDecisions.innerHTML = '';
+  }
+
+  if (clientQuestions.length > 0) {
+    pnlAuditClientSection.style.display = 'block';
+    pnlAuditClientQuestions.innerHTML = clientQuestions.map((decision) => `
+      <div class="audit-decision-card">
+        <div class="audit-decision-topline">
+          <div class="audit-decision-title">${escapeHtml(decision.questionTitle)}</div>
+          <div class="audit-decision-answer">Client follow-up</div>
+        </div>
+        <div class="audit-decision-copy">${escapeHtml(decision.clientQuestion)}</div>
+        ${decision.note ? `<div class="audit-decision-copy audit-decision-copy-muted">Accountant context: ${escapeHtml(decision.note)}</div>` : ''}
+      </div>
+    `).join('');
+  } else {
+    pnlAuditClientSection.style.display = 'none';
+    pnlAuditClientQuestions.innerHTML = '';
   }
 }
 
@@ -1400,6 +1666,13 @@ function showProfessionalResults(data) {
 
   if (data.reviewSummary?.resolvedQuestions) {
     reviewParts.push(`Resolved ${data.reviewSummary.resolvedQuestions.toLocaleString()} review question(s) before finalizing this statement.`);
+  }
+
+  const clientFollowUpCount = Array.isArray(data.reviewSummary?.answers)
+    ? data.reviewSummary.answers.filter((answer) => answer.needsClientAnswer && normalizeWhitespace(answer.clientQuestion)).length
+    : 0;
+  if (clientFollowUpCount > 0) {
+    reviewParts.push(`Queued ${clientFollowUpCount.toLocaleString()} client follow-up question(s) from the accountant inbox.`);
   }
 
   reviewParts.push(`Included ${data.includedTransactionCount.toLocaleString()} transaction(s) in the statement.`);

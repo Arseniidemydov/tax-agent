@@ -67,6 +67,8 @@ const SIMPLE_MODE = 'simple';
 const PROFESSIONAL_MODE = 'professional';
 const PROFESSIONAL_REVIEW_STANDARD = 'standard';
 const PROFESSIONAL_REVIEW_STRICT = 'strict';
+const REVIEW_DECISION_SCOPE_RUN_ONLY = 'run_only';
+const REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE = 'save_company_rule';
 const PNL_SECTION_ORDER = ['Income', 'Cost of Goods Sold', 'Expenses', 'Other Income', 'Other Expenses'];
 const MAX_REVIEW_QUESTIONS = 6;
 const STANDARD_REVIEW_RESERVED_NON_TRANSFER_QUESTIONS = 3;
@@ -2111,13 +2113,15 @@ function upsertPersistedReviewRule(rulePayload, companyId) {
 
 function persistAppliedReviewRules(reviewState, answers) {
   const companyProfile = getCompanyProfileOrThrow(reviewState.companyId);
-  const answerMap = new Map(normalizeReviewAnswersPayload(answers).map((answer) => [answer.questionId, answer.optionKey]));
+  const answerMap = new Map(normalizeReviewAnswersPayload(answers).map((answer) => [answer.questionId, answer]));
   let createdRuleCount = 0;
   let updatedRuleCount = 0;
 
   for (const question of reviewState.questions) {
-    const selectedOptionKey = answerMap.get(question.id);
+    const submittedAnswer = answerMap.get(question.id);
+    const selectedOptionKey = submittedAnswer?.optionKey;
     if (!selectedOptionKey) continue;
+    if (normalizeReviewDecisionScope(submittedAnswer?.decisionScope, question) !== REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE) continue;
 
     const selectedOption = question.options.find((option) => option.key === selectedOptionKey);
     if (!selectedOption?.override) continue;
@@ -4806,6 +4810,42 @@ function buildProfessionalCoverageReviewQuestions(
     .sort((a, b) => a.priority - b.priority || b.totalAmount - a.totalAmount);
 }
 
+function canPersistReviewQuestion(question = null) {
+  return ['transfer_review', 'refund_review', 'category_conflict', 'generic_review', 'verifier_category_review'].includes(question?.type);
+}
+
+function getDefaultReviewDecisionScope(question = null) {
+  return canPersistReviewQuestion(question)
+    ? REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE
+    : REVIEW_DECISION_SCOPE_RUN_ONLY;
+}
+
+function normalizeReviewDecisionScope(decisionScope, question = null) {
+  const normalized = normalizeWhitespace(decisionScope);
+  if (normalized === REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE && canPersistReviewQuestion(question)) {
+    return REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE;
+  }
+
+  return REVIEW_DECISION_SCOPE_RUN_ONLY;
+}
+
+function getReviewDecisionScopeLabel(decisionScope = REVIEW_DECISION_SCOPE_RUN_ONLY) {
+  return decisionScope === REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE
+    ? 'Save for future company runs'
+    : 'This run only';
+}
+
+function buildReviewClientQuestionSuggestion(question = null) {
+  const sample = Array.isArray(question?.sampleDescriptions) && question.sampleDescriptions.length > 0
+    ? question.sampleDescriptions[0]
+    : normalizeWhitespace(question?.clusterLabel) || normalizeWhitespace(question?.title) || 'this transaction cluster';
+  const optionLabels = Array.isArray(question?.options)
+    ? question.options.slice(0, 3).map((option) => normalizeWhitespace(option.label)).filter(Boolean)
+    : [];
+  const optionText = optionLabels.length > 0 ? ` Options we are considering: ${optionLabels.join(' / ')}.` : '';
+  return `Can you confirm how "${sample}" should be treated in the books?${optionText}`;
+}
+
 function getPublicReviewQuestion(question) {
   return {
     id: question.id,
@@ -4821,6 +4861,9 @@ function getPublicReviewQuestion(question) {
     totalAmount: question.totalAmount,
     sampleDescriptions: question.sampleDescriptions,
     sourceFiles: question.sourceFiles,
+    canSaveAsRule: canPersistReviewQuestion(question),
+    defaultDecisionScope: getDefaultReviewDecisionScope(question),
+    clientQuestionSuggestion: buildReviewClientQuestionSuggestion(question),
     options: question.options.map((option) => ({
       key: option.key,
       label: option.label,
@@ -4907,7 +4950,23 @@ async function buildProfessionalReviewState(
 
 function normalizeReviewAnswersPayload(answers) {
   if (Array.isArray(answers)) {
-    return answers;
+    return answers
+      .map((answer) => {
+        if (!answer || typeof answer !== 'object') return null;
+        const questionId = normalizeWhitespace(answer.questionId);
+        const optionKey = normalizeWhitespace(answer.optionKey);
+        if (!questionId || !optionKey) return null;
+
+        return {
+          questionId,
+          optionKey,
+          note: normalizeWhitespace(answer.note),
+          needsClientAnswer: Boolean(answer.needsClientAnswer),
+          clientQuestion: normalizeWhitespace(answer.clientQuestion),
+          decisionScope: normalizeWhitespace(answer.decisionScope),
+        };
+      })
+      .filter(Boolean);
   }
 
   if (answers && typeof answers === 'object') {
@@ -4920,11 +4979,12 @@ function normalizeReviewAnswersPayload(answers) {
 }
 
 function applyReviewAnswers(reviewState, answers) {
-  const answerMap = new Map(normalizeReviewAnswersPayload(answers).map((answer) => [answer.questionId, answer.optionKey]));
+  const answerMap = new Map(normalizeReviewAnswersPayload(answers).map((answer) => [answer.questionId, answer]));
   const appliedAnswers = [];
 
   for (const question of reviewState.questions) {
-    const selectedOptionKey = answerMap.get(question.id);
+    const submittedAnswer = answerMap.get(question.id);
+    const selectedOptionKey = submittedAnswer?.optionKey;
 
     if (!selectedOptionKey) {
       throw new Error(`Missing answer for review question "${question.title}"`);
@@ -4957,12 +5017,23 @@ function applyReviewAnswers(reviewState, answers) {
       }
     }
 
+    const needsClientAnswer = Boolean(submittedAnswer?.needsClientAnswer);
+    const clientQuestion = needsClientAnswer
+      ? normalizeWhitespace(submittedAnswer?.clientQuestion) || buildReviewClientQuestionSuggestion(question)
+      : '';
+    const decisionScope = normalizeReviewDecisionScope(submittedAnswer?.decisionScope, question);
+
     appliedAnswers.push({
       questionId: question.id,
       questionTitle: question.title,
       questionType: question.type,
       answerKey: selectedOption.key,
       answerLabel: selectedOption.label,
+      note: normalizeWhitespace(submittedAnswer?.note),
+      needsClientAnswer,
+      clientQuestion,
+      decisionScope,
+      decisionScopeLabel: getReviewDecisionScopeLabel(decisionScope),
     });
   }
 
@@ -6065,6 +6136,12 @@ function buildProfessionalAudit(
   persistedRuleSummary = null,
   reviewMode = PROFESSIONAL_REVIEW_STANDARD,
 ) {
+  const clientFollowUpCount = Array.isArray(reviewSummary?.answers)
+    ? reviewSummary.answers.filter((answer) => answer.needsClientAnswer && normalizeWhitespace(answer.clientQuestion)).length
+    : 0;
+  const runOnlyDecisionCount = Array.isArray(reviewSummary?.answers)
+    ? reviewSummary.answers.filter((answer) => answer.decisionScope === REVIEW_DECISION_SCOPE_RUN_ONLY).length
+    : 0;
   const counts = {
     modelSectionCount: 0,
     fallbackSectionCount: 0,
@@ -6125,6 +6202,8 @@ function buildProfessionalAudit(
       { label: 'Drift-prone remaps held', value: verifierSummary?.stabilityHeldClusterCount || 0, format: 'count' },
       { label: 'OpenAI auto-mappings applied', value: verifierSummary?.autoAppliedClusterCount || 0, format: 'count' },
       { label: 'User review decisions applied', value: reviewSummary?.resolvedQuestions || 0, format: 'count' },
+      { label: 'Client follow-up questions queued', value: clientFollowUpCount, format: 'count' },
+      { label: 'Run-only review decisions', value: runOnlyDecisionCount, format: 'count' },
     ],
     logicSteps: [
       `Parsed ${classifiedTransactions.length.toLocaleString()} transaction(s) from the uploaded bank statements and normalized dates, amounts, descriptions, and Schedule C categories.`,
@@ -6154,6 +6233,9 @@ function buildProfessionalAudit(
       reviewSummary?.savedRuleSummary?.savedRuleCount
         ? `Saved ${reviewSummary.savedRuleSummary.savedRuleCount.toLocaleString()} answered review cluster(s) as reusable rules for future professional runs.`
         : 'No new reusable review rules were saved during this run.',
+      clientFollowUpCount > 0
+        ? `Queued ${clientFollowUpCount.toLocaleString()} client follow-up question(s) directly from the accountant review inbox.`
+        : 'No client follow-up questions were queued from the accountant review inbox during this run.',
       isStrictProfessionalReviewMode(reviewMode)
         ? 'Strict review mode was enabled, so the professional P&L paused for any material or unclear cluster instead of auto-applying verifier remaps.'
         : 'Standard review mode was enabled, so previously approved rules and high-confidence verifier remaps could auto-apply before final review.',
@@ -6175,6 +6257,11 @@ function buildProfessionalAudit(
       ? reviewSummary.answers.map((answer) => ({
         questionTitle: answer.questionTitle,
         answerLabel: answer.answerLabel,
+        decisionScope: answer.decisionScope,
+        decisionScopeLabel: answer.decisionScopeLabel,
+        note: answer.note,
+        needsClientAnswer: Boolean(answer.needsClientAnswer),
+        clientQuestion: answer.clientQuestion,
       }))
       : [],
   };
