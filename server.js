@@ -6707,6 +6707,10 @@ app.delete('/api/professional-settings/review-rules/:id', (req, res) => {
 
 app.post('/api/upload', upload.array('statements', 20), (req, res) => {
   try {
+    if (!GEMINI_API_KEY) {
+      return res.status(500).json({ error: 'GEMINI_API_KEY is not configured on the server' });
+    }
+
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({ error: 'No PDF files uploaded' });
     }

@@ -112,6 +112,7 @@ const PROFESSIONAL_REVIEW_STRICT = 'strict';
 const COMPANY_STORAGE_KEY = 'tax-agent.active-company-id';
 const REVIEW_DECISION_SCOPE_RUN_ONLY = 'run_only';
 const REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE = 'save_company_rule';
+const API_BASE_URL = String(import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
 
 selectedCompanyId = loadStoredCompanyId();
 
@@ -277,6 +278,35 @@ function saveStoredCompanyId(companyId) {
   }
 }
 
+function apiUrl(path) {
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  if (!API_BASE_URL) return normalizedPath;
+
+  if (API_BASE_URL.endsWith('/api') && normalizedPath.startsWith('/api/')) {
+    return `${API_BASE_URL}${normalizedPath.slice(4)}`;
+  }
+
+  return `${API_BASE_URL}${normalizedPath}`;
+}
+
+function apiFetch(path, options = {}) {
+  return fetch(apiUrl(path), options);
+}
+
+async function readJsonResponse(response, fallbackMessage = 'Server returned an unexpected response') {
+  const text = await response.text();
+  if (!text) return {};
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    if (!response.ok) {
+      throw new Error(`${fallbackMessage} (${response.status})`);
+    }
+    throw new Error(fallbackMessage);
+  }
+}
+
 function withCompanyQuery(path) {
   if (!selectedCompanyId) return path;
   const separator = path.includes('?') ? '&' : '?';
@@ -312,8 +342,8 @@ function updateSettingsCompanyNote(settings = professionalSettings) {
 
 async function loadCompanies({ preferredCompanyId = selectedCompanyId, silent = false } = {}) {
   try {
-    const response = await fetch(withCompanyQuery('/api/companies'));
-    const payload = await response.json();
+    const response = await apiFetch(withCompanyQuery('/api/companies'));
+    const payload = await readJsonResponse(response, 'Failed to load company profiles');
     if (!response.ok) {
       throw new Error(payload.error || 'Failed to load company profiles');
     }
@@ -891,7 +921,7 @@ async function submitReviewAnswers() {
   reviewSubmitBtn.innerHTML = '<div class="spinner"></div><span>Building Final P&amp;L...</span>';
 
   try {
-    const response = await fetch(`/api/review/${currentJobId}`, {
+    const response = await apiFetch(`/api/review/${currentJobId}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -906,7 +936,7 @@ async function submitReviewAnswers() {
       }),
     });
 
-    const payload = await response.json();
+    const payload = await readJsonResponse(response, 'Failed to apply review answers');
     if (!response.ok) {
       throw new Error(payload.error || 'Failed to apply review answers');
     }
@@ -1200,7 +1230,7 @@ async function downloadClientQuestions() {
   clientDownloadBtn.innerHTML = '<div class="spinner"></div><span>Generating Client Packet...</span>';
 
   try {
-    const response = await fetch('/api/report', {
+    const response = await apiFetch('/api/report', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1216,12 +1246,8 @@ async function downloadClientQuestions() {
 
     if (!response.ok) {
       let message = 'Failed to generate client question packet';
-      try {
-        const errorPayload = await response.json();
-        if (errorPayload?.error) message = errorPayload.error;
-      } catch {
-        // ignore parse errors
-      }
+      const errorPayload = await readJsonResponse(response, message);
+      if (errorPayload?.error) message = errorPayload.error;
       throw new Error(message);
     }
 
@@ -1259,7 +1285,7 @@ async function submitClientReviewAnswers() {
   clientSubmitBtn.innerHTML = '<div class="spinner"></div><span>Finalizing Professional P&amp;L...</span>';
 
   try {
-    const response = await fetch(`/api/client-review/${currentJobId}`, {
+    const response = await apiFetch(`/api/client-review/${currentJobId}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1272,7 +1298,7 @@ async function submitClientReviewAnswers() {
       }),
     });
 
-    const payload = await response.json();
+    const payload = await readJsonResponse(response, 'Failed to apply client review answers');
     if (!response.ok) {
       throw new Error(payload.error || 'Failed to apply client review answers');
     }
@@ -1323,12 +1349,12 @@ companyCreateForm.addEventListener('submit', async (event) => {
   setSettingsStatus('Creating company profile...', 'info');
 
   try {
-    const response = await fetch('/api/companies', {
+    const response = await apiFetch('/api/companies', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name }),
     });
-    const payload = await response.json();
+    const payload = await readJsonResponse(response, 'Failed to create company profile');
     if (!response.ok) {
       throw new Error(payload.error || 'Failed to create company profile');
     }
@@ -1441,10 +1467,9 @@ function startStatusPolling(jobId) {
 
   statusPollInterval = setInterval(async () => {
     try {
-      const res = await fetch(`/api/status/${jobId}`);
-      if (!res.ok) throw new Error('Failed to get status');
-
-      const job = await res.json();
+      const res = await apiFetch(`/api/status/${jobId}`);
+      const job = await readJsonResponse(res, 'Failed to get status');
+      if (!res.ok) throw new Error(job.error || 'Failed to get status');
       const jobMode = job.analysisMode === 'professional' ? 'professional' : selectedAnalysisMode;
       const jobReviewMode = normalizeProfessionalReviewMode(job.reviewMode || selectedProfessionalReviewMode);
       const jobCopy = getModeCopy(jobMode, jobReviewMode);
@@ -1553,17 +1578,16 @@ uploadBtn.addEventListener('click', async () => {
   }
 
   try {
-    const response = await fetch('/api/upload', {
+    const response = await apiFetch('/api/upload', {
       method: 'POST',
       body: formData,
     });
 
+    const payload = await readJsonResponse(response, 'Server error');
     if (!response.ok) {
-      const err = await response.json();
-      throw new Error(err.error || 'Server error');
+      throw new Error(payload.error || 'Server error');
     }
 
-    const payload = await response.json();
     const { jobId, companyName } = payload;
     currentJobId = jobId;
     addLogEntry('success', `Upload accepted. Job ID: ${jobId}${companyName ? ` for ${companyName}` : ''}`);
@@ -1896,8 +1920,8 @@ async function loadProfessionalSettings({ silent = false } = {}) {
   }
 
   try {
-    const response = await fetch(withCompanyQuery('/api/professional-settings'));
-    const payload = await response.json();
+    const response = await apiFetch(withCompanyQuery('/api/professional-settings'));
+    const payload = await readJsonResponse(response, 'Failed to load professional settings');
     if (!response.ok) {
       throw new Error(payload.error || 'Failed to load professional settings');
     }
@@ -1918,8 +1942,8 @@ async function loadProfessionalSettings({ silent = false } = {}) {
 async function updateProfessionalSettingsRequest(url, options = {}, successMessage = 'Settings updated.') {
   setSettingsStatus('Saving professional settings...', 'info');
 
-  const response = await fetch(withCompanyQuery(url), options);
-  const payload = await response.json();
+  const response = await apiFetch(withCompanyQuery(url), options);
+  const payload = await readJsonResponse(response, 'Failed to update professional settings');
   if (!response.ok) {
     throw new Error(payload.error || 'Failed to update professional settings');
   }
@@ -2169,7 +2193,7 @@ quickReportDownloadBtn.addEventListener('click', async () => {
   setQuickReportDownloadButtonLoading();
 
   try {
-    const response = await fetch('/api/report', {
+    const response = await apiFetch('/api/report', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2183,12 +2207,8 @@ quickReportDownloadBtn.addEventListener('click', async () => {
 
     if (!response.ok) {
       let message = 'Failed to generate quick report';
-      try {
-        const errorPayload = await response.json();
-        if (errorPayload?.error) message = errorPayload.error;
-      } catch {
-        // Ignore JSON parse failures and keep the generic message.
-      }
+      const errorPayload = await readJsonResponse(response, message);
+      if (errorPayload?.error) message = errorPayload.error;
       throw new Error(message);
     }
 
@@ -2216,13 +2236,16 @@ downloadBtn.addEventListener('click', async () => {
   setDownloadButtonLoading();
 
   try {
-    const response = await fetch('/api/report', {
+    const response = await apiFetch('/api/report', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(reportData),
     });
 
-    if (!response.ok) throw new Error('Failed to generate report');
+    if (!response.ok) {
+      const errorPayload = await readJsonResponse(response, 'Failed to generate report');
+      throw new Error(errorPayload.error || 'Failed to generate report');
+    }
 
     const blob = await response.blob();
     const url = URL.createObjectURL(blob);
