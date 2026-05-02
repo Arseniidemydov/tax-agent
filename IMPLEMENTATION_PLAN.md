@@ -477,7 +477,11 @@ The first two waves of Phase 7 shipped together with the Claude API migration:
 - **7.3 Few-shot for high-drift buckets** — added a `VENDOR DISAMBIGUATION GUIDE` section to the professional extraction prompt with concrete vendor-name examples for `Subcontractors`, `Advertising and Promotion`, `Telephone Expense`, `Meals and Entertainment`, and `Legal & Professional Fees`. Sits in the cached system block so the prompt-cache hit rate is unaffected.
 - **7.6 Accountant-style PDF parity** — `drawProfessionalReport` and `drawQuickReport` rewritten in plain Helvetica with no color fills, thin horizontal rules, indented hierarchy, parentheses for negative amounts, and a single `Cash Basis  <date>` footer. Quick reports now use QuickBooks-style column layout (`Distribution Account | Date | Type | Name | Memo / Description | Source Account / Full Name | Amount | Balance`). Validated by re-rendering against the 12-statement test JSON.
 
-Open items: `7.4` verifier tuning, `7.5` vendor canonicalization, `7.7` parity benchmark harness, `7.8` AMA lane.
+**Wave 3:**
+
+- **7.7 (partial) Parity reporter** — `npm run parity` reads every `data/flo-parity-run*.json` snapshot and prints a per-run drift table against the canonical Flo Marketing accountant figures (income / COGS / expenses / net income), plus an optional per-bucket drift table via `--groups` covering Subcontractors, Advertising and Promotion, Legal & Professional Fees, Meals and Entertainment, Telephone Expense, Bank Charge service, and Ask My Accountant. The best run (lowest absolute net-income drift) is auto-marked. Substring filter: `npm run parity -- legal` matches all four legal-* snapshots. **Deferred:** a true *replayer* (re-run today's classifier against historical raw extractions) needs raw transactions persisted at extraction time — current dumps are post-classified, not replayable. Tracked as a follow-up.
+
+Open items: `7.4` verifier tuning, `7.5` vendor canonicalization, `7.7` parity replayer, `7.8` AMA lane.
 
 ### 7.1 Reconcile Against Statement Balances [SHIPPED]
 
@@ -572,7 +576,7 @@ QuickReport PDF changes ([`server.js:7170`](server.js#L7170)):
 
 - Generated P&L and quick reports can sit next to the Flo Marketing sample package without looking like a prototype
 
-### 7.7 Standing Parity Benchmark
+### 7.7 Standing Parity Benchmark [PARTIAL — SHIPPED]
 
 `data/flo-parity-run*.json` already contains six historical runs (~80k lines each) but there is no harness that runs them and reports drift per bucket.
 

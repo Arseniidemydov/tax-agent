@@ -8,7 +8,8 @@
     "build": "vite build",
     "server": "node server.js",
     "start": "node server.js",
-    "dev:all": "concurrently \"npm run server\" \"npm run dev\""
+    "dev:all": "concurrently \"npm run server\" \"npm run dev\"",
+    "parity": "node scripts/parity.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.40.0",
