@@ -462,15 +462,22 @@ Move from "AI report generator" to a bookkeeping system.
 
 Direct, measurable lifts in report accuracy, parity, and accountant-grade trust. Each item below is selected because its primary effect is *better reports*, not new features.
 
-### Shipped Subset (initial wave)
+### Shipped Subset (waves 1-2)
 
-The first wave of Phase 7 shipped together with the Claude API migration:
+The first two waves of Phase 7 shipped together with the Claude API migration:
+
+**Wave 1 (alongside the Claude swap):**
 
 - **7.1 Reconciliation** — per-statement opening/closing balance check, surfaced as `statementReconciliations` and `reconciliationAlerts` in the audit panel, plus two new overview stats. Validated end-to-end on a 12-statement test pack: all 12 statements reconciled to the penny (`delta=$0.00`).
 - **7.2 (partial) Tighter extraction schema** — `category` and `plSection` are now closed-enum constrained in the tool schema (previously free strings), so Claude can no longer emit values outside the known set. The full 7.2 (drop dual classification entirely) deferred because the existing `category_conflict` review signal depends on a Schedule C category being present.
 - **7.9 Correctness fixes** — `OWNER (DRAW|DISTRIBUTION|PAYMENT)` ignore pattern tightened to `OWNER (DRAW|DISTRIBUTION)` so legitimate owner payments are no longer silently dropped. The exponential-backoff retry policy was already implemented as part of the Claude migration.
 
-Open items: `7.3` few-shot, `7.4` verifier tuning, `7.5` vendor canonicalization, `7.6` PDF parity, `7.7` parity benchmark harness, `7.8` AMA lane.
+**Wave 2:**
+
+- **7.3 Few-shot for high-drift buckets** — added a `VENDOR DISAMBIGUATION GUIDE` section to the professional extraction prompt with concrete vendor-name examples for `Subcontractors`, `Advertising and Promotion`, `Telephone Expense`, `Meals and Entertainment`, and `Legal & Professional Fees`. Sits in the cached system block so the prompt-cache hit rate is unaffected.
+- **7.6 Accountant-style PDF parity** — `drawProfessionalReport` and `drawQuickReport` rewritten in plain Helvetica with no color fills, thin horizontal rules, indented hierarchy, parentheses for negative amounts, and a single `Cash Basis  <date>` footer. Quick reports now use QuickBooks-style column layout (`Distribution Account | Date | Type | Name | Memo / Description | Source Account / Full Name | Amount | Balance`). Validated by re-rendering against the 12-statement test JSON.
+
+Open items: `7.4` verifier tuning, `7.5` vendor canonicalization, `7.7` parity benchmark harness, `7.8` AMA lane.
 
 ### 7.1 Reconcile Against Statement Balances [SHIPPED]
 
@@ -503,7 +510,7 @@ The professional prompt asks Gemini for both a Schedule C `category` and `plSect
 - Extraction returns a value strictly inside the closed classification set
 - Drift in the four high-impact buckets is reduced on the parity benchmark
 
-### 7.3 Few-Shot Block For The Four High-Drift Buckets
+### 7.3 Few-Shot Block For The Four High-Drift Buckets [SHIPPED]
 
 Add 8-12 hand-picked examples to the professional extraction prompt, drawn from `data/flo-parity-run-*.json`, specifically the wordings that have historically drifted:
 
@@ -545,7 +552,7 @@ The Flo `Report Subcontractors.pdf` sample shows a clean `NAME` column (`Express
 - Same memo family lands in the same account on repeated runs (the existing accountant-readiness gate)
 - Quick reports show a clean `NAME` column distinct from `MEMO/DESCRIPTION`
 
-### 7.6 Accountant-Style PDF Parity
+### 7.6 Accountant-Style PDF Parity [SHIPPED]
 
 `drawProfessionalReport` ([`server.js:7415`](server.js#L7415)) uses colored fills, a rounded summary card, and a `Tax Agent` footer. The Flo sample is plain Helvetica, no fills, single rule lines, right-aligned totals, and a `Cash Basis  <date>` footer.
 

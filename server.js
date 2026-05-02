@@ -1177,6 +1177,32 @@ IMPORTANT RULES:
 6. If statement metadata is not visible, use empty strings or nulls instead of guessing.
 7. Return ONLY the JSON object, no markdown, no prose.
 
+VENDOR DISAMBIGUATION GUIDE (apply to the four most commonly mis-classified buckets):
+
+- Subcontractors (Cost of Goods Sold > Subcontractors): vendors paid to deliver client work,
+  including marketing-services partners and ACH/Zelle payments to named individuals or LLCs.
+  Examples of memos that belong here: "Online ACH Payment ... To Expresso", "Online ACH
+  Payment ... To Legatmarketing", "Online ACH Payment ... To Allamericanmarketing", "Same-Day
+  ACH Payment ... To Movearound", "Zelle Payment To Denni Diaz".
+
+- Advertising and Promotion (Cost of Goods Sold > Advertising and Promotion): paid ad spend
+  on platforms. Use plAccount "Facebook" for "FACEBK ADS" / "META PLATFORMS"; "Google ADS"
+  for "GOOGLE ADS" / "GOOGLE *GSUITE ADS"; "Lead Generation" for lead-generation vendors and
+  direct-response marketing payout rails such as Steven/ST vendor payments.
+
+- Telephone Expense (Expenses > Telephone Expense): cell, telecom, and voice service.
+  Examples: "AT&T", "ATT", "VERIZON WIRELESS", "T-MOBILE", "SPECTRUM MOBILE", "RING CENTRAL".
+  Do not classify these as Computer and Internet or Utilities.
+
+- Meals and Entertainment (Expenses > Meals and Entertainment): meals, restaurants, and
+  client dining. Examples: "DOORDASH", "UBER EATS", "GRUBHUB", "CHIPOTLE", "STARBUCKS",
+  "MCDONALDS", restaurant names. Do not classify these as Travel Expense.
+
+- Legal & Professional Fees (Expenses > Legal & Professional Fees): attorneys, accountants,
+  consultants, and other professional services. Examples: "ATTORNEY", "LAW OFFICES OF",
+  "LAW FIRM", "CPA", "CONSULTING", "FORBES HARE TRUST". Trust-company wires, attorney
+  payments, and retainers belong here even when the bank memo contains wire/transfer wording.
+
 Example output:
 {
   "statementMeta": {
@@ -7323,150 +7349,173 @@ function safeClientQuestionCompanyName(value = '') {
   return normalizeWhitespace(value) || 'client-questions';
 }
 
-function drawQuickReportMetricCard(doc, x, y, width, label, value) {
-  doc.roundedRect(x, y, width, 70, 10).fill('#f3f6ff');
-  doc.fontSize(9).font('Helvetica-Bold').fillColor('#5b6b92')
-    .text(label, x + 14, y + 12, { width: width - 28 });
-  doc.fontSize(16).font('Helvetica-Bold').fillColor('#16213e')
-    .text(value, x + 14, y + 32, { width: width - 28 });
-}
-
-function getQuickReportTableColumns(report) {
-  return [
-    { key: 'date', label: 'Date', width: 62 },
-    { key: 'transactionType', label: 'Type', width: 82 },
-    { key: 'name', label: 'Name', width: 122 },
-    { key: 'memo', label: 'Memo / Description', width: 246 },
-    { key: 'split', label: report.kind === 'source' ? 'Distribution Account' : 'Source Account', width: 132 },
-    { key: 'amount', label: 'Amount', width: 59, align: 'right' },
-    { key: 'runningBalance', label: 'Balance', width: 59, align: 'right' },
+function getQuickReportTableColumns(report, tableWidth) {
+  // Column widths scale to fit the available page width (landscape A4 minus
+  // margins, ~722 pts at 40-pt margins). Ratios chosen to match the
+  // QuickBooks Account QuickReport layout in the Flo sample.
+  const ratios = [
+    { key: 'distributionAccount', label: 'Distribution Account', ratio: 0.13 },
+    { key: 'date', label: 'Date', ratio: 0.075 },
+    { key: 'transactionType', label: 'Type', ratio: 0.075 },
+    { key: 'name', label: 'Name', ratio: 0.14 },
+    { key: 'memo', label: 'Memo / Description', ratio: 0.31 },
+    { key: 'split', label: report.kind === 'source' ? 'Full Name' : 'Source Account', ratio: 0.135 },
+    { key: 'amount', label: 'Amount', ratio: 0.07, align: 'right' },
+    { key: 'runningBalance', label: 'Balance', ratio: 0.07, align: 'right' },
   ];
+
+  const totalRatio = ratios.reduce((sum, column) => sum + column.ratio, 0);
+  return ratios.map((column) => ({ ...column, width: (column.ratio / totalRatio) * tableWidth }));
 }
 
 function getQuickReportRowValue(report, row, columnKey) {
+  if (columnKey === 'distributionAccount') {
+    // For source-account reports the distribution column shows where the
+    // money went; for distribution reports it shows the report's own
+    // account so the layout matches the Flo sample.
+    return report.kind === 'source'
+      ? row.distributionAccount || ''
+      : report.title || row.distributionAccount || '';
+  }
   if (columnKey === 'split') {
     return report.kind === 'source'
       ? row.distributionAccount || ''
       : row.sourceAccount || '';
   }
 
-  if (columnKey === 'amount') return formatSignedCurrency(row.amount || 0);
-  if (columnKey === 'runningBalance') return formatSignedCurrency(row.runningBalance || 0);
+  if (columnKey === 'amount') return formatAccountantAmount(row.amount || 0);
+  if (columnKey === 'runningBalance') return formatAccountantAmount(row.runningBalance || 0);
   return row[columnKey] || '';
 }
 
-function drawQuickReportTableHeader(doc, report) {
-  const tableX = doc.page.margins.left;
-  const tableY = doc.y;
-  const columns = getQuickReportTableColumns(report);
-  const tableWidth = columns.reduce((sum, column) => sum + column.width, 0);
-
-  doc.rect(tableX, tableY, tableWidth, 22).fill('#1f4f96');
-  doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#fff');
-
+function drawQuickReportColumnHeader(doc, columns, tableX, tableWidth) {
+  const y = doc.y;
+  doc.save();
+  doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#000000');
   let currentX = tableX;
   columns.forEach((column) => {
-    doc.text(column.label, currentX + 8, tableY + 7, {
-      width: column.width - 16,
+    doc.text(column.label, currentX + 4, y, {
+      width: column.width - 8,
       align: column.align || 'left',
+      lineBreak: false,
     });
     currentX += column.width;
   });
+  doc.restore();
 
-  doc.y = tableY + 22;
-  return { tableX, tableWidth, columns };
+  // Thin top + bottom rule sandwiching the column headers.
+  const ruleTop = y - 3;
+  const ruleBottom = y + 12;
+  doc.save();
+  doc.lineWidth(0.5).strokeColor('#000000');
+  doc.moveTo(tableX, ruleTop).lineTo(tableX + tableWidth, ruleTop).stroke();
+  doc.moveTo(tableX, ruleBottom).lineTo(tableX + tableWidth, ruleBottom).stroke();
+  doc.restore();
+
+  doc.y = ruleBottom + 4;
 }
 
 function drawQuickReport(doc, data, report) {
   const rows = Array.isArray(report?.rows) ? report.rows : [];
-  const endingBalance = rows.length > 0 ? rows[rows.length - 1].runningBalance || 0 : 0;
-  const sourceFiles = Array.isArray(report?.sourceFiles) ? report.sourceFiles : [];
-  const sourcePreview = sourceFiles.slice(0, 4).join(', ');
-  const extraSources = sourceFiles.length > 4 ? ` +${sourceFiles.length - 4} more` : '';
+  const margin = doc.page.margins.left;
+  const tableX = margin;
+  const contentRight = doc.page.width - doc.page.margins.right;
+  const tableWidth = contentRight - tableX;
+  const columns = getQuickReportTableColumns(report, tableWidth);
+  const companyName = data.companyName || '';
 
-  doc.fontSize(22).font('Helvetica-Bold').fillColor('#16213e')
-    .text(report.kind === 'source' ? 'Source Account Quick Report' : 'Distribution Quick Report', { align: 'center' });
-  doc.moveDown(0.2);
-  doc.fontSize(11).font('Helvetica-Bold').fillColor('#1f4f96')
-    .text(report.title || 'Quick Report', { align: 'center' });
-  doc.fontSize(9.5).font('Helvetica').fillColor('#5b6477')
-    .text(report.subtitle || 'Transaction activity report', { align: 'center' });
-
+  // --- Header block. Title is "Account QuickReport" to match the Flo
+  // QuickBooks output, with the report's own name on the second line.
+  doc.fontSize(18).font('Helvetica-Bold').fillColor('#000000')
+    .text('Account QuickReport', margin, doc.y, {
+      width: contentRight - margin,
+      align: 'center',
+    });
+  doc.moveDown(0.25);
+  if (companyName) {
+    doc.fontSize(12).font('Helvetica-Bold').fillColor('#000000')
+      .text(companyName, margin, doc.y, {
+        width: contentRight - margin,
+        align: 'center',
+      });
+    doc.moveDown(0.15);
+  }
   if (data.periodLabel) {
-    doc.text(`Period: ${data.periodLabel}`, { align: 'center' });
+    doc.fontSize(10).font('Helvetica').fillColor('#000000')
+      .text(data.periodLabel, margin, doc.y, {
+        width: contentRight - margin,
+        align: 'center',
+      });
+  }
+  doc.moveDown(1);
+
+  drawQuickReportColumnHeader(doc, columns, tableX, tableWidth);
+
+  // Group label row immediately under the column headers, e.g.
+  // "Subcontractors" — matches the Flo sample.
+  if (report.title) {
+    doc.fontSize(9.5).font('Helvetica-Bold').fillColor('#000000');
+    doc.text(report.title, tableX + 4, doc.y, { lineBreak: false });
+    doc.y += 16;
   }
 
-  doc.moveDown(0.8);
-
-  const cardY = doc.y;
-  const cardX = doc.page.margins.left;
-  const gap = 16;
-  const cardWidth = (doc.page.width - doc.page.margins.left - doc.page.margins.right - (gap * 2)) / 3;
-  drawQuickReportMetricCard(doc, cardX, cardY, cardWidth, 'Transactions', `${(report.transactionCount || 0).toLocaleString()}`);
-  drawQuickReportMetricCard(doc, cardX + cardWidth + gap, cardY, cardWidth, 'Total Movement', formatSignedCurrency(report.total || 0));
-  drawQuickReportMetricCard(doc, cardX + ((cardWidth + gap) * 2), cardY, cardWidth, report.balanceLabel || 'Ending Balance', formatSignedCurrency(endingBalance));
-  doc.y = cardY + 82;
-
-  if (report.note) {
-    doc.fontSize(9).font('Helvetica').fillColor('#3f4c63')
-      .text(report.note, { width: doc.page.width - doc.page.margins.left - doc.page.margins.right });
-    doc.moveDown(0.5);
-  }
-
-  if (sourcePreview) {
-    doc.fontSize(8.5).font('Helvetica').fillColor('#677185')
-      .text(`Source files: ${sourcePreview}${extraSources}`, { width: doc.page.width - doc.page.margins.left - doc.page.margins.right });
-    doc.moveDown(0.8);
-  }
-
-  const headerState = drawQuickReportTableHeader(doc, report);
   let rowY = doc.y;
+  const bottomLimit = doc.page.height - doc.page.margins.bottom;
 
-  rows.forEach((row, index) => {
-    const rowValues = headerState.columns.map((column) => String(getQuickReportRowValue(report, row, column.key) || ''));
+  rows.forEach((row) => {
+    const rowValues = columns.map((column) => String(getQuickReportRowValue(report, row, column.key) || ''));
     const rowHeight = Math.max(
-      18,
-      ...headerState.columns.map((column, columnIndex) => doc.heightOfString(rowValues[columnIndex], {
-        width: column.width - 12,
+      14,
+      ...columns.map((column, columnIndex) => doc.heightOfString(rowValues[columnIndex], {
+        width: column.width - 8,
         align: column.align || 'left',
-      }) + 8),
+      }) + 4),
     );
 
-    if (rowY + rowHeight > doc.page.height - doc.page.margins.bottom - 24) {
+    if (rowY + rowHeight > bottomLimit) {
       doc.addPage();
-      doc.y = doc.page.margins.top;
-      drawQuickReportTableHeader(doc, report);
+      drawQuickReportColumnHeader(doc, columns, tableX, tableWidth);
       rowY = doc.y;
     }
 
-    if (index % 2 === 0) {
-      doc.rect(headerState.tableX, rowY, headerState.tableWidth, rowHeight).fill('#f9fbff');
-    }
-
-    doc.fontSize(8.2).font('Helvetica').fillColor('#1f2937');
-
-    let currentX = headerState.tableX;
-    headerState.columns.forEach((column, columnIndex) => {
-      doc.text(rowValues[columnIndex], currentX + 6, rowY + 4, {
-        width: column.width - 12,
+    doc.fontSize(8.5).font('Helvetica').fillColor('#000000');
+    let currentX = tableX;
+    columns.forEach((column, columnIndex) => {
+      doc.text(rowValues[columnIndex], currentX + 4, rowY + 2, {
+        width: column.width - 8,
         align: column.align || 'left',
       });
       currentX += column.width;
     });
 
-    doc.moveTo(headerState.tableX, rowY + rowHeight)
-      .lineTo(headerState.tableX + headerState.tableWidth, rowY + rowHeight)
-      .strokeColor('#dfe7f5')
-      .lineWidth(0.5)
-      .stroke();
-
     rowY += rowHeight;
     doc.y = rowY;
   });
 
-  doc.moveDown(1);
-  doc.fontSize(8).font('Helvetica').fillColor('#999')
-    .text('This quick report was generated automatically by Tax Agent.', { align: 'center' });
+  // Single closing rule under the final row.
+  doc.save();
+  doc.lineWidth(0.5).strokeColor('#000000');
+  doc.moveTo(tableX, rowY + 1).lineTo(tableX + tableWidth, rowY + 1).stroke();
+  doc.restore();
+
+  // Single trailing footer line, "Cash Basis  <date>", centered.
+  doc.y = rowY + 12;
+  const now = new Date();
+  const stamp = now.toLocaleString('en-US', {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: false,
+  });
+  doc.fontSize(8).font('Helvetica').fillColor('#000000')
+    .text(`Cash Basis  ${stamp}`, tableX, doc.y, {
+      width: tableWidth,
+      align: 'center',
+      lineBreak: false,
+    });
 }
 
 function drawClientQuestionReport(doc, data, clientReview = {}) {
@@ -7622,105 +7671,170 @@ function drawClientQuestionReport(doc, data, clientReview = {}) {
     .text('This client clarification packet was generated automatically by Tax Agent.', { align: 'center' });
 }
 
+function formatAccountantAmount(value, { withDollar = false } = {}) {
+  const num = Number(value) || 0;
+  const absolute = Math.abs(num).toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  const prefix = withDollar ? '$' : '';
+  return num < 0 ? `(${prefix}${absolute})` : `${prefix}${absolute}`;
+}
+
+function drawProfessionalReportColumnHeader(doc) {
+  const margin = doc.page.margins.left;
+  const contentRight = doc.page.width - doc.page.margins.right;
+  const y = doc.y;
+
+  doc.save();
+  doc.fontSize(9).font('Helvetica-Bold').fillColor('#000000');
+  doc.text('DISTRIBUTION ACCOUNT', margin, y, { lineBreak: false });
+  doc.text('TOTAL', margin, y, {
+    width: contentRight - margin,
+    align: 'right',
+    lineBreak: false,
+  });
+  doc.restore();
+
+  // Thin rule under the column header.
+  const ruleY = y + 14;
+  doc.save();
+  doc.lineWidth(0.5).strokeColor('#000000');
+  doc.moveTo(margin, ruleY).lineTo(contentRight, ruleY).stroke();
+  doc.restore();
+
+  doc.y = ruleY + 4;
+}
+
 function drawProfessionalReport(doc, data) {
   const {
-    transactionCount = 0,
-    includedTransactionCount = 0,
-    excludedCount = 0,
     periodLabel = '',
-    totalIncome = 0,
-    totalCostOfGoodsSold = 0,
-    grossProfit = 0,
-    totalExpenses = 0,
-    netOperatingIncome = 0,
-    totalOtherIncome = 0,
-    totalOtherExpenses = 0,
-    netIncome = 0,
+    companyName = '',
     statementRows = [],
   } = data;
 
-  doc.fontSize(22).font('Helvetica-Bold').fillColor('#1a1a2e')
-    .text('Professional Profit & Loss', { align: 'center' });
-  doc.moveDown(0.25);
-  doc.fontSize(10).font('Helvetica').fillColor('#666')
-    .text('Cash-basis statement generated from uploaded bank statements', { align: 'center' });
+  const margin = doc.page.margins.left;
+  const contentRight = doc.page.width - doc.page.margins.right;
+  const indentStep = 14;
+
+  const drawHorizontalRule = (y, lineWidth = 0.5) => {
+    doc.save();
+    doc.lineWidth(lineWidth).strokeColor('#000000');
+    doc.moveTo(margin, y).lineTo(contentRight, y).stroke();
+    doc.restore();
+  };
+
+  // --- Header block: plain Helvetica, centered, no color fills.
+  doc.fontSize(20).font('Helvetica-Bold').fillColor('#000000')
+    .text('Profit and Loss', margin, doc.y, {
+      width: contentRight - margin,
+      align: 'center',
+    });
+  doc.moveDown(0.35);
+  if (companyName) {
+    doc.fontSize(13).font('Helvetica-Bold').fillColor('#000000')
+      .text(companyName, margin, doc.y, {
+        width: contentRight - margin,
+        align: 'center',
+      });
+    doc.moveDown(0.15);
+  }
   if (periodLabel) {
-    doc.text(`Period: ${periodLabel}`, { align: 'center' });
+    doc.fontSize(10.5).font('Helvetica').fillColor('#000000')
+      .text(periodLabel, margin, doc.y, {
+        width: contentRight - margin,
+        align: 'center',
+      });
   }
-  doc.text(`Transactions analyzed: ${transactionCount}`, { align: 'center' });
-  if (excludedCount > 0) {
-    doc.text(`Excluded from P&L view: ${excludedCount}`, { align: 'center' });
-  }
-  doc.moveDown(1);
+  doc.moveDown(1.1);
 
-  const summaryY = doc.y;
-  doc.roundedRect(50, summaryY, 495, 96, 10).fill('#f0f4ff');
-  doc.fontSize(12).font('Helvetica-Bold').fillColor('#1a1a2e')
-    .text('Summary', 70, summaryY + 10);
-  doc.fontSize(10).font('Helvetica').fillColor('#333');
+  drawProfessionalReportColumnHeader(doc);
 
-  doc.text(`Income: ${formatCurrency(totalIncome)}`, 70, summaryY + 30);
-  doc.text(`COGS: ${formatCurrency(totalCostOfGoodsSold)}`, 70, summaryY + 48);
-  doc.text(`Gross Profit: ${formatCurrency(grossProfit)}`, 70, summaryY + 66);
-
-  doc.text(`Expenses: ${formatCurrency(totalExpenses)}`, 245, summaryY + 30);
-  doc.text(`Net Operating Income: ${formatCurrency(netOperatingIncome)}`, 245, summaryY + 48);
-  doc.text(`Net Income: ${formatCurrency(netIncome)}`, 245, summaryY + 66);
-
-  doc.text(`Included transactions: ${includedTransactionCount}`, 430, summaryY + 30, { width: 95, align: 'right' });
-  doc.text(`Other Income: ${formatCurrency(totalOtherIncome)}`, 360, summaryY + 48, { width: 165, align: 'right' });
-  doc.text(`Other Expenses: ${formatCurrency(totalOtherExpenses)}`, 360, summaryY + 66, { width: 165, align: 'right' });
-
-  doc.y = summaryY + 112;
-  drawProfessionalTableHeader(doc);
-
+  const bottomLimit = doc.page.height - doc.page.margins.bottom;
   let rowY = doc.y;
-  statementRows.forEach((row) => {
-    const rowHeight = row.type === 'section' ? 22 : row.type === 'metric' ? 24 : 18;
 
-    if (rowY > 740) {
+  const ensureSpace = (rowHeight) => {
+    if (rowY + rowHeight > bottomLimit) {
       doc.addPage();
-      doc.y = 50;
-      drawProfessionalTableHeader(doc);
+      drawProfessionalReportColumnHeader(doc);
       rowY = doc.y;
     }
+  };
 
-    const labelX = 62 + ((row.depth || 0) * 18);
+  const drawAmount = (text, y) => {
+    doc.text(text, margin, y, {
+      width: contentRight - margin,
+      align: 'right',
+      lineBreak: false,
+    });
+  };
+
+  statementRows.forEach((row) => {
+    const labelX = margin + 4 + ((row.depth || 0) * indentStep);
 
     if (row.type === 'section') {
-      doc.rect(50, rowY, 495, rowHeight).fill('#edf3ff');
-      doc.fontSize(11).font('Helvetica-Bold').fillColor('#1a1a2e');
-      doc.text(row.label, 62, rowY + 6);
+      ensureSpace(22);
+      doc.fontSize(11).font('Helvetica-Bold').fillColor('#000000');
+      doc.text(row.label, margin + 4, rowY + 6, { lineBreak: false });
+      rowY += 22;
     } else if (row.type === 'metric') {
-      doc.rect(50, rowY, 495, rowHeight).fill('#e4efff');
-      doc.fontSize(10.5).font('Helvetica-Bold').fillColor('#153b73');
-      doc.text(row.label, 62, rowY + 7);
-      doc.text(formatCurrency(row.total), 390, rowY + 7, { width: 135, align: 'right' });
+      // Gross Profit / Net Operating Income / Net Income.
+      // Thin top + bottom rules flag this as a key total line.
+      ensureSpace(26);
+      drawHorizontalRule(rowY + 2, 0.75);
+      doc.fontSize(10.5).font('Helvetica-Bold').fillColor('#000000');
+      doc.text(row.label, margin + 4, rowY + 8, { lineBreak: false });
+      drawAmount(formatAccountantAmount(row.total, { withDollar: true }), rowY + 8);
+      drawHorizontalRule(rowY + 24, 0.75);
+      rowY += 26;
     } else if (row.type === 'section-total') {
-      doc.rect(50, rowY, 495, rowHeight).fill('#f7f9fc');
-      doc.fontSize(10).font('Helvetica-Bold').fillColor('#1a1a2e');
-      doc.text(row.label, 62, rowY + 5);
-      doc.text(formatCurrency(row.total), 390, rowY + 5, { width: 135, align: 'right' });
+      ensureSpace(20);
+      drawHorizontalRule(rowY + 1, 0.5);
+      doc.fontSize(10).font('Helvetica-Bold').fillColor('#000000');
+      doc.text(row.label, margin + 4, rowY + 6, { lineBreak: false });
+      drawAmount(formatAccountantAmount(row.total, { withDollar: true }), rowY + 6);
+      rowY += 20;
     } else if (row.type === 'subtotal') {
-      doc.fontSize(9.5).font('Helvetica-Bold').fillColor('#334155');
-      doc.text(row.label, labelX, rowY + 4);
-      doc.text(formatCurrency(row.total), 390, rowY + 4, { width: 135, align: 'right' });
+      ensureSpace(16);
+      doc.fontSize(9.5).font('Helvetica-Bold').fillColor('#000000');
+      doc.text(row.label, labelX, rowY + 4, { lineBreak: false });
+      drawAmount(formatAccountantAmount(row.total, { withDollar: true }), rowY + 4);
+      rowY += 16;
     } else if (row.type === 'group') {
-      doc.fontSize(9.5).font('Helvetica-Bold').fillColor('#e2e8f0');
-      doc.text(row.label, labelX, rowY + 4);
+      ensureSpace(16);
+      doc.fontSize(9.5).font('Helvetica-Bold').fillColor('#000000');
+      doc.text(row.label, labelX, rowY + 4, { lineBreak: false });
+      rowY += 16;
     } else {
-      doc.fontSize(9).font('Helvetica').fillColor('#1f2937');
-      doc.text(row.label, labelX, rowY + 4);
-      doc.text(formatCurrency(row.total), 390, rowY + 4, { width: 135, align: 'right' });
+      // Account row — plain weight, no $ sign on per-row totals.
+      ensureSpace(14);
+      doc.fontSize(9).font('Helvetica').fillColor('#000000');
+      doc.text(row.label, labelX, rowY + 3, { lineBreak: false });
+      drawAmount(formatAccountantAmount(row.total), rowY + 3);
+      rowY += 14;
     }
 
-    rowY += rowHeight;
     doc.y = rowY;
   });
 
+  // Single trailing footer line, "Cash Basis  <date>", centered.
   doc.moveDown(1.5);
-  doc.fontSize(8).font('Helvetica').fillColor('#999')
-    .text('This report was generated automatically by Tax Agent.', { align: 'center' });
+  const now = new Date();
+  const stamp = now.toLocaleString('en-US', {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: false,
+  });
+  doc.fontSize(8).font('Helvetica').fillColor('#000000')
+    .text(`Cash Basis  ${stamp}`, margin, doc.y, {
+      width: contentRight - margin,
+      align: 'center',
+      lineBreak: false,
+    });
 }
 
 app.post('/api/report', (req, res) => {
