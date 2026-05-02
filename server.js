@@ -6856,6 +6856,50 @@ function serializeJob(job) {
 
 const jobs = {};
 
+// Fire-and-forget GET notification to an external webhook every time a P&L
+// job reaches a terminal completed state. Never throws and never blocks
+// the caller — failures are logged and ignored. Configurable via the
+// PNL_WEBHOOK_URL env var; set it empty to disable.
+const PNL_WEBHOOK_URL = process.env.PNL_WEBHOOK_URL
+  || 'https://lovoiceagent.app.n8n.cloud/webhook/4afec0e0-5f5d-4c63-baef-1e1a0b68e04e';
+const PNL_WEBHOOK_TIMEOUT_MS = Number.parseInt(process.env.PNL_WEBHOOK_TIMEOUT_MS || '5000', 10);
+
+function notifyPnLWebhook(job) {
+  if (!PNL_WEBHOOK_URL) return;
+
+  try {
+    const data = job?.data || {};
+    const audit = data.audit || {};
+    const reconciliationMismatches = (audit.reconciliationAlerts || []).length;
+
+    const params = new URLSearchParams();
+    params.set('jobId', String(job?.id || ''));
+    params.set('status', String(job?.status || ''));
+    params.set('mode', String(job?.analysisMode || ''));
+    params.set('company', String(job?.companyName || ''));
+    params.set('period', String(data.periodLabel || ''));
+    params.set('transactionCount', String(data.transactionCount ?? ''));
+    if (data.netIncome != null) params.set('netIncome', String(data.netIncome));
+    if (reconciliationMismatches > 0) params.set('reconciliationMismatches', String(reconciliationMismatches));
+    params.set('finishedAt', new Date().toISOString());
+
+    const url = `${PNL_WEBHOOK_URL}${PNL_WEBHOOK_URL.includes('?') ? '&' : '?'}${params.toString()}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), PNL_WEBHOOK_TIMEOUT_MS);
+
+    fetch(url, { method: 'GET', signal: controller.signal })
+      .then((res) => {
+        console.log(`[Job ${job?.id}] P&L webhook fired (status ${res.status}).`);
+      })
+      .catch((err) => {
+        console.warn(`[Job ${job?.id}] P&L webhook failed: ${err.message}`);
+      })
+      .finally(() => clearTimeout(timeout));
+  } catch (err) {
+    console.warn(`[Job ${job?.id}] P&L webhook setup error: ${err.message}`);
+  }
+}
+
 function finalizeProfessionalReviewJob(job, answers) {
   const appliedAnswers = applyReviewAnswers(job.reviewState, answers);
   const savedRuleSummary = persistAppliedReviewRules(job.reviewState, answers);
@@ -6885,6 +6929,7 @@ function finalizeProfessionalReviewJob(job, answers) {
     job.data.warning = null;
   }
 
+  notifyPnLWebhook(job);
   return serializeJob(job);
 }
 
@@ -7235,6 +7280,7 @@ async function processJob(jobId, files, analysisMode, reviewMode = null, company
         job.error = null;
         job.data.warning = null;
       }
+      notifyPnLWebhook(job);
     } else {
       report = buildAnalysisReport(allTransactions, analysisMode, statementMetas, reviewMode, companyProfile);
       job.progress = 100;
@@ -7250,6 +7296,7 @@ async function processJob(jobId, files, analysisMode, reviewMode = null, company
         job.error = null;
         job.data.warning = null;
       }
+      notifyPnLWebhook(job);
     }
 
     console.log(`[Job ${jobId}] Finished with status ${job.status}. Success: ${successCount}, errors: ${errorCount}, transactions: ${report ? report.transactionCount : 0}.`);
