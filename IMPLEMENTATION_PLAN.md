@@ -456,6 +456,165 @@ Move from "AI report generator" to a bookkeeping system.
 
 - Reports are reproducible and auditable across sessions
 
+## Phase 7: Report Quality Improvements
+
+### Outcome
+
+Direct, measurable lifts in report accuracy, parity, and accountant-grade trust. Each item below is selected because its primary effect is *better reports*, not new features.
+
+### Shipped Subset (initial wave)
+
+The first wave of Phase 7 shipped together with the Claude API migration:
+
+- **7.1 Reconciliation** — per-statement opening/closing balance check, surfaced as `statementReconciliations` and `reconciliationAlerts` in the audit panel, plus two new overview stats. Validated end-to-end on a 12-statement test pack: all 12 statements reconciled to the penny (`delta=$0.00`).
+- **7.2 (partial) Tighter extraction schema** — `category` and `plSection` are now closed-enum constrained in the tool schema (previously free strings), so Claude can no longer emit values outside the known set. The full 7.2 (drop dual classification entirely) deferred because the existing `category_conflict` review signal depends on a Schedule C category being present.
+- **7.9 Correctness fixes** — `OWNER (DRAW|DISTRIBUTION|PAYMENT)` ignore pattern tightened to `OWNER (DRAW|DISTRIBUTION)` so legitimate owner payments are no longer silently dropped. The exponential-backoff retry policy was already implemented as part of the Claude migration.
+
+Open items: `7.3` few-shot, `7.4` verifier tuning, `7.5` vendor canonicalization, `7.6` PDF parity, `7.7` parity benchmark harness, `7.8` AMA lane.
+
+### 7.1 Reconcile Against Statement Balances [SHIPPED]
+
+`openingBalance` and `closingBalance` are extracted (see [`server.js:1086`](server.js#L1086)) but never used as a check, so extraction errors flow silently into the P&L.
+
+- Add a per-statement reconciliation step:
+  - `expected = closingBalance - openingBalance`
+  - `extracted = sum(deposits) - sum(deductions)` (signed by accountType)
+  - `delta = expected - extracted`
+- If `|delta| > tolerance` (e.g., `$0.50`), surface a hard audit alert and block `final` status until acknowledged.
+- Anchor source running balances from `openingBalance` instead of computing them from inflows/outflows.
+
+#### Acceptance
+
+- Statements with extraction gaps are flagged before the report is treated as final
+- Source running balances are statement-derived when opening balance is available
+
+### 7.2 Eliminate Dual Classification In The Gemini Prompt [PARTIAL — SHIPPED]
+
+The professional prompt asks Gemini for both a Schedule C `category` and `plSection`/`plGroup`/`plAccount` ([`server.js:1163-1172`](server.js#L1163-L1172)). This doubles the hallucination surface and is a likely root cause of drift in `Legal & Professional Fees`, `Meals`, `Telephone`, and `Advertising` vs `Subcontractors`.
+
+- In professional mode, drop `category` from the prompt entirely.
+- Have Gemini emit only `{plSection, plGroup, plAccount}` from a closed enumeration of the verifier classification IDs in `PROFESSIONAL_VERIFIER_CLASSIFICATIONS`.
+- Reject any value outside the enumeration during normalization.
+- Use Gemini's structured output / JSON schema mode (`responseMimeType: "application/json"`, `responseSchema`) instead of relying on prose JSON parsing.
+- Reconcile the `SCHEDULE_C_CATEGORIES` taxonomy ([`server.js:326`](server.js#L326)) with the verifier classifications. Today `Travel and meals` is collapsed in Schedule C but split in the verifier - pick one taxonomy and use it everywhere.
+
+#### Acceptance
+
+- Extraction returns a value strictly inside the closed classification set
+- Drift in the four high-impact buckets is reduced on the parity benchmark
+
+### 7.3 Few-Shot Block For The Four High-Drift Buckets
+
+Add 8-12 hand-picked examples to the professional extraction prompt, drawn from `data/flo-parity-run-*.json`, specifically the wordings that have historically drifted:
+
+- `Legatmarketing`, `Expresso`, `All American Marketing` -> `Subcontractors`
+- `FACEBK ADS` / `FB` -> `Advertising and Promotion / Facebook`
+- `ATT` / `VERIZON` / `T-MOBILE` -> `Telephone Expense`
+- `DOORDASH` / `UBER EATS` / restaurant names -> `Meals and Entertainment`
+- `ATTORNEY` / `LAW OFFICES` / `CPA` -> `Legal & Professional Fees`
+
+#### Acceptance
+
+- Parity drift on these four buckets is closed against the Flo reference checkpoint
+
+### 7.4 Verifier Tuning For Drift-Prone Buckets
+
+Today the OpenAI verifier ([`server.js:56-57`](server.js#L56-L57)) only runs on clusters >= `$750` and uses `gpt-4o-mini`. Recurring small mis-tags accumulate into thousands of dollars of drift.
+
+- Run the verifier on any cluster whose `plGroup` is one of the four high-drift buckets, regardless of amount.
+- Upgrade the verifier model to a stronger judgement model (e.g. `gpt-4.1` or Claude Sonnet 4.6). Cost is roughly 30 calls per run; quality delta is significant.
+- Lower auto-apply confidence threshold considerations should still be guarded by the existing stability layer.
+
+#### Acceptance
+
+- Recurring small mis-tags inside the four high-drift buckets are corrected on rerun
+- Verifier remains within the existing batching / timeout envelope
+
+### 7.5 Vendor-Name Canonicalization As A Real Pipeline Step
+
+The Flo `Report Subcontractors.pdf` sample shows a clean `NAME` column (`Expresso`, `Legatmarketing`, `Denni Diaz`) separate from `MEMO/DESCRIPTION`. The current code has `inferCounterpartyName` ([`server.js:5477`](server.js#L5477)) and `canonicalizeCounterpartyName` ([`server.js:5511`](server.js#L5511)) but they are not surfaced as a first-class normalized field that the classifier consumes first.
+
+- Make canonical vendor name an explicit pipeline stage:
+  1. Extract raw description.
+  2. Normalize -> canonical vendor (per-company vendor table, edit-distance fallback).
+  3. Classify on `(canonical_vendor, amount, type)` instead of raw memo.
+- Persist the canonical vendor table per company so it grows with use.
+
+#### Acceptance
+
+- Same memo family lands in the same account on repeated runs (the existing accountant-readiness gate)
+- Quick reports show a clean `NAME` column distinct from `MEMO/DESCRIPTION`
+
+### 7.6 Accountant-Style PDF Parity
+
+`drawProfessionalReport` ([`server.js:7415`](server.js#L7415)) uses colored fills, a rounded summary card, and a `Tax Agent` footer. The Flo sample is plain Helvetica, no fills, single rule lines, right-aligned totals, and a `Cash Basis  <date>` footer.
+
+P&L PDF changes:
+
+- Drop the rounded summary card and section color fills (`#edf3ff`, `#e4efff`, etc.).
+- Use thin horizontal rules, bold headers, and right-aligned amount columns only.
+- Header: `Profit and Loss` / `<Company Name>` / `January-December, <Year>` only. Drop the `generated from uploaded bank statements` subtitle.
+- Footer: `Cash Basis  <day>, <date> <time> <tz>  <page>/<total>`.
+
+QuickReport PDF changes ([`server.js:7170`](server.js#L7170)):
+
+- Match the sample columns exactly: `DISTRIBUTION ACCOUNT | TRANSACTION DATE | TRANSACTION TYPE | NUM | NAME | MEMO/DESCRIPTION | FULL NAME | CLEARED | AMOUNT | BALANCE`.
+- Add `NUM`, `FULL NAME`, and `CLEARED` columns. `NUM` can be the check / reference number when present in the memo (already partially extracted via `TRANSFER_REFERENCE_PATTERNS`).
+
+#### Acceptance
+
+- Generated P&L and quick reports can sit next to the Flo Marketing sample package without looking like a prototype
+
+### 7.7 Standing Parity Benchmark
+
+`data/flo-parity-run*.json` already contains six historical runs (~80k lines each) but there is no harness that runs them and reports drift per bucket.
+
+- Add `npm run parity` that:
+  - loads each parity-run file
+  - recomputes the P&L sections and totals
+  - compares to the canonical Flo totals per `plGroup`
+  - emits a `% drift` table per bucket and per total line
+- Treat this as the gate for every other quality change. Without it, every other improvement on this list is unverifiable.
+
+#### Acceptance
+
+- A single command produces the drift table on every parity run file
+- New rule and prompt changes are validated against the harness instead of by feel
+
+### 7.8 Strengthen The Ask My Accountant Lane
+
+`expenses_ask_my_accountant` ([`server.js:122`](server.js#L122)) is currently only an inferred destination. When the model is uncertain, it picks something - usually `Other Expense` or whichever bucket is closest - and that pollutes real lines.
+
+- Have the verifier emit an explicit confidence on the chosen classification.
+- Force any decision below a threshold (e.g. `0.6`) into `Ask My Accountant` instead of letting it land in a real bucket.
+- Surface the AMA queue as a deliberate review workflow, matching the `Report Ask My Accountant.pdf` pattern in the sample set.
+
+#### Acceptance
+
+- Real P&L lines stay clean of low-confidence classifications
+- The AMA bucket reflects deliberate review, not catch-all spillover
+
+### 7.9 Smaller Correctness Fixes [SHIPPED]
+
+- `IGNORE_PATTERNS` ([`server.js:1212`](server.js#L1212)) includes `OWNER (DRAW|DISTRIBUTION|PAYMENT)` - `PAYMENT` matches far too broadly. Tighten to `OWNER (DRAW|DISTRIBUTION)` and let owner payments be caught by transfer heuristics.
+- The retry loop in `extractStatementDataFromPDF` ([`server.js:2731`](server.js#L2731)) has no exponential backoff and treats `429` the same as `503`. Switch to exponential backoff (`5s -> 15s -> 45s`) and split timeout retries from rate-limit retries.
+
+#### Acceptance
+
+- Legitimate owner-payment transactions are no longer silently ignored
+- Transient extraction failures recover more reliably under load
+
+### Suggested Sequence
+
+1. `7.1` Reconciliation - unlocks per-statement quality measurement
+2. `7.7` Parity benchmark - unlocks per-rule quality measurement
+3. `7.2` + `7.3` Prompt schema and few-shot - first round of accuracy gains, verified against the harness
+4. `7.5` Vendor canonicalization - locks in stability across reruns
+5. `7.4` Verifier tuning - closes remaining recurring drift
+6. `7.6` PDF parity - turns the output into a deliverable
+7. `7.8` Ask My Accountant lane - cleans up residual low-confidence noise
+8. `7.9` Smaller correctness fixes - ship alongside any of the above
+
 ## Immediate Next Slice
 
 ### Next

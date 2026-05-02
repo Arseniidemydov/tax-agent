@@ -1,8 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
-import { GoogleGenerativeAI } from '@google/generative-ai';
-import OpenAI from 'openai';
+import Anthropic from '@anthropic-ai/sdk';
 import PDFDocument from 'pdfkit';
 import fs from 'fs';
 import path from 'path';
@@ -47,12 +46,11 @@ loadLocalEnvFile(path.join(projectRoot, '.env'));
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3-flash-preview';
-const GEMINI_TIMEOUT_MS = Number.parseInt(process.env.GEMINI_TIMEOUT_MS || '120000', 10);
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-const OPENAI_TIMEOUT_MS = Number.parseInt(process.env.OPENAI_TIMEOUT_MS || '45000', 10);
-const OPENAI_VERIFIER_BATCH_SIZE = Math.max(1, Number.parseInt(process.env.OPENAI_VERIFIER_BATCH_SIZE || '6', 10) || 6);
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
+const ANTHROPIC_TIMEOUT_MS = Number.parseInt(process.env.ANTHROPIC_TIMEOUT_MS || '120000', 10);
+const ANTHROPIC_VERIFIER_TIMEOUT_MS = Number.parseInt(process.env.ANTHROPIC_VERIFIER_TIMEOUT_MS || '60000', 10);
+const ANTHROPIC_VERIFIER_BATCH_SIZE = Math.max(1, Number.parseInt(process.env.ANTHROPIC_VERIFIER_BATCH_SIZE || '6', 10) || 6);
 const OPENAI_VERIFIER_MIN_CLUSTER_AMOUNT = Number.parseFloat(process.env.OPENAI_VERIFIER_MIN_CLUSTER_AMOUNT || '750');
 const OPENAI_VERIFIER_AUTO_APPLY_CONFIDENCE = Number.parseFloat(process.env.OPENAI_VERIFIER_AUTO_APPLY_CONFIDENCE || '0.88');
 const COMPANY_PROFILES_STORE_PATH = path.join(projectRoot, 'data', 'company-profiles.json');
@@ -527,7 +525,6 @@ function serializeChartAccountEntry(entry) {
   };
 }
 
-const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 
 function coercePersistedRuleString(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -1209,7 +1206,7 @@ const IGNORE_PATTERNS = [
   /\bAMEX EPAYMENT\b/i,
   /\bLOAN PROCEEDS?\b/i,
   /\bCAPITAL CONTRIBUTION\b/i,
-  /\bOWNER (DRAW|DISTRIBUTION|PAYMENT)\b/i,
+  /\bOWNER (DRAW|DISTRIBUTION)\b/i,
   /\bINTERNAL TRANSFER\b/i,
 ];
 
@@ -1316,11 +1313,11 @@ const upload = multer({
   },
 });
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-
-if (!GEMINI_API_KEY) {
-  console.warn('WARNING: GEMINI_API_KEY is not set!');
+if (!ANTHROPIC_API_KEY) {
+  console.warn('WARNING: ANTHROPIC_API_KEY is not set!');
 }
+
+const anthropic = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
 
 function normalizeAnalysisMode(value) {
   return value === PROFESSIONAL_MODE ? PROFESSIONAL_MODE : SIMPLE_MODE;
@@ -2721,61 +2718,156 @@ function normalizeExtractionResult(parsedPayload, sourceFile = '') {
   };
 }
 
+function buildExtractionTool(analysisMode) {
+  // Closed enums on category and plSection eliminate the most common
+  // drift vectors (free-string emissions outside the known set).
+  // plGroup/plAccount stay free-text for now; downstream rules and the
+  // verifier collapse them onto the configured chart of accounts.
+  const transactionProperties = {
+    date: { type: 'string', description: 'Transaction date, MM/DD/YYYY when possible' },
+    description: { type: 'string', description: 'Transaction description / memo, whitespace normalized' },
+    amount: { type: 'number', description: 'Absolute amount (no sign, no symbols)' },
+    type: { type: 'string', enum: ['deposit', 'deduction'] },
+    category: {
+      type: 'string',
+      enum: SCHEDULE_C_CATEGORIES,
+      description: 'Schedule C category that best matches this transaction',
+    },
+  };
+
+  const required = ['date', 'description', 'amount', 'type', 'category'];
+
+  if (analysisMode === PROFESSIONAL_MODE) {
+    transactionProperties.plSection = {
+      type: 'string',
+      enum: ['Income', 'Cost of Goods Sold', 'Expenses', 'Other Income', 'Other Expenses', 'Ignore'],
+    };
+    transactionProperties.plGroup = { type: 'string', description: 'Concise parent P&L line such as Sales, Advertising and Promotion, Subcontractors, Travel Expense, Office Expense, Bank Charge service. Reuse the same wording across repeated vendors.' };
+    transactionProperties.plAccount = { type: 'string', description: 'Concise detail account under the group, or the same text as plGroup when no detail split is needed' };
+    required.push('plSection', 'plGroup', 'plAccount');
+  }
+
+  return {
+    name: 'record_statement_extraction',
+    description: 'Record the parsed statement metadata and full transaction list extracted from the uploaded bank statement PDF.',
+    input_schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['statementMeta', 'transactions'],
+      properties: {
+        statementMeta: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['institution', 'accountName', 'accountType', 'accountLast4', 'statementStartDate', 'statementEndDate', 'openingBalance', 'closingBalance', 'currency'],
+          properties: {
+            institution: { type: 'string' },
+            accountName: { type: 'string' },
+            accountType: { type: 'string', description: 'One of Checking, Savings, Credit Card, Loan, Other' },
+            accountLast4: { type: 'string' },
+            statementStartDate: { type: 'string', description: 'MM/DD/YYYY when visible, else empty' },
+            statementEndDate: { type: 'string', description: 'MM/DD/YYYY when visible, else empty' },
+            openingBalance: { type: ['number', 'null'] },
+            closingBalance: { type: ['number', 'null'] },
+            currency: { type: 'string', description: '3-letter code, default USD' },
+          },
+        },
+        transactions: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required,
+            properties: transactionProperties,
+          },
+        },
+      },
+    },
+  };
+}
+
 async function extractStatementDataFromPDF(pdfBuffer, analysisMode, fileName = 'statement.pdf') {
-  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-  const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
-  const prompt = getExtractionPrompt(analysisMode);
+  if (!anthropic) {
+    throw new Error('ANTHROPIC_API_KEY is not set; cannot extract statement data.');
+  }
+
+  const systemPrompt = getExtractionPrompt(analysisMode);
+  const tool = buildExtractionTool(analysisMode);
   const base64PDF = pdfBuffer.toString('base64');
 
-  let result;
-  let retries = 3;
+  let lastError = null;
+  let backoffMs = 5000;
 
-  while (retries > 0) {
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
     try {
       const startedAt = Date.now();
-      console.log(`    Sending ${analysisMode} extraction request to Gemini for ${fileName} using model ${GEMINI_MODEL} (${Math.round(pdfBuffer.length / 1024)} KB, timeout ${Math.round(GEMINI_TIMEOUT_MS / 1000)}s)`);
+      console.log(`    Sending ${analysisMode} extraction request to Claude for ${fileName} using model ${ANTHROPIC_MODEL} (${Math.round(pdfBuffer.length / 1024)} KB, timeout ${Math.round(ANTHROPIC_TIMEOUT_MS / 1000)}s)`);
 
-      result = await withTimeout(
-        model.generateContent([
-          { text: prompt },
-          {
-            inlineData: {
-              mimeType: 'application/pdf',
-              data: base64PDF,
+      const response = await withTimeout(
+        anthropic.messages.create({
+          model: ANTHROPIC_MODEL,
+          max_tokens: 16000,
+          system: [
+            {
+              type: 'text',
+              text: systemPrompt,
+              cache_control: { type: 'ephemeral' },
             },
-          },
-        ]),
-        GEMINI_TIMEOUT_MS,
-        `Gemini request timed out after ${Math.round(GEMINI_TIMEOUT_MS / 1000)}s for ${fileName}`,
+          ],
+          tools: [tool],
+          tool_choice: { type: 'tool', name: tool.name },
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'document',
+                  source: {
+                    type: 'base64',
+                    media_type: 'application/pdf',
+                    data: base64PDF,
+                  },
+                },
+                {
+                  type: 'text',
+                  text: `Extract every transaction from ${fileName}. Use the tool to record the result.`,
+                },
+              ],
+            },
+          ],
+        }),
+        ANTHROPIC_TIMEOUT_MS,
+        `Claude request timed out after ${Math.round(ANTHROPIC_TIMEOUT_MS / 1000)}s for ${fileName}`,
       );
 
-      console.log(`    Gemini responded for ${fileName} in ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
-      break;
+      console.log(`    Claude responded for ${fileName} in ${((Date.now() - startedAt) / 1000).toFixed(1)}s (cache_read=${response.usage?.cache_read_input_tokens ?? 0}, cache_write=${response.usage?.cache_creation_input_tokens ?? 0})`);
+
+      const toolUseBlock = (response.content || []).find((block) => block?.type === 'tool_use' && block?.name === tool.name);
+      if (!toolUseBlock || !toolUseBlock.input) {
+        throw new Error(`Claude response missing the ${tool.name} tool call for ${fileName}.`);
+      }
+
+      return normalizeExtractionResult(toolUseBlock.input, fileName);
     } catch (err) {
-      const isRetriable = err.message.includes('503') || err.message.includes('429') || err.message.includes('timed out');
-      if (isRetriable) {
-        retries -= 1;
-        if (retries === 0) throw err;
-        console.log(`    Gemini request failed for ${fileName}: ${err.message}`);
-        console.log(`    Retrying in 5s... (${retries} retries left)`);
-        await new Promise((resolve) => setTimeout(resolve, 5000));
-      } else {
+      lastError = err;
+      const message = err?.message || '';
+      const status = err?.status || err?.response?.status;
+      const isRateLimit = status === 429 || /rate[_ ]?limit/i.test(message);
+      const isOverloaded = status === 529 || status === 503 || /overloaded/i.test(message);
+      const isTimeout = /timed out/i.test(message);
+      const isRetriable = isRateLimit || isOverloaded || isTimeout || (status >= 500 && status < 600);
+
+      if (!isRetriable || attempt === 4) {
         throw err;
       }
+
+      console.log(`    Claude extraction failed for ${fileName} (attempt ${attempt}/4): ${message}`);
+      console.log(`    Retrying in ${Math.round(backoffMs / 1000)}s...`);
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      backoffMs *= 3;
     }
   }
 
-  const responseText = result.response.text();
-  console.log('--- RAW AI RESPONSE ---');
-  console.log(`${responseText.substring(0, 500)}...`);
-
-  try {
-    const parsedPayload = parseStructuredExtractionPayload(responseText);
-    return normalizeExtractionResult(parsedPayload, fileName);
-  } catch (err) {
-    console.error('FAILED TO PARSE JSON. RAW TEXT WAS:', responseText);
-    throw err;
-  }
+  throw lastError || new Error('Claude extraction failed for unknown reason.');
 }
 
 function sanitizeTransactions(rawTransactions) {
@@ -4239,64 +4331,97 @@ function buildProfessionalVerifierCandidates(transactions, reviewMode = PROFESSI
     .slice(0, MAX_OPENAI_VERIFIER_CLUSTERS);
 }
 
-async function requestProfessionalVerifierBatchDecisions(
-  candidates,
-  companyProfile = null,
-  batchIndex = 0,
-  batchCount = 1,
-) {
-  const configuredClassifications = getConfiguredProfessionalVerifierClassifications(companyProfile);
-  const schema = {
-    type: 'object',
-    additionalProperties: false,
-    required: ['clusterDecisions'],
-    properties: {
-      clusterDecisions: {
-        type: 'array',
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          required: ['clusterKey', 'classificationId', 'confidence', 'needsUserConfirmation', 'reason', 'alternatives'],
-          properties: {
-            clusterKey: { type: 'string', minLength: 1 },
-            classificationId: { type: 'string', minLength: 1 },
-            confidence: { type: 'number', minimum: 0, maximum: 1 },
-            needsUserConfirmation: { type: 'boolean' },
-            reason: { type: 'string' },
-            alternatives: {
-              type: 'array',
-              items: { type: 'string' },
-              maxItems: 2,
+const VERIFIER_SYSTEM_INSTRUCTIONS = [
+  'You are a senior bookkeeper performing a second-pass category review for bank-statement clusters before a professional cash-basis P&L is built.',
+  'Choose exactly one classificationId from the allowed chart of accounts for each cluster.',
+  'Do not invent new accounts, sections, or ids.',
+  'You also receive INTERNAL_TOOL_RESULTS from deterministic bookkeeping helpers. Treat these as evidence, not as suggestions from another model.',
+  'Use ignore_transfer for internal transfers, credit-card payments, balance-sheet activity, owner movements, or loan activity.',
+  'Trust-company wires, attorney payments, law firms, retainers, and professional advisory/consulting vendors can still be Legal & Professional Fees even when the bank memo contains wire or transfer wording.',
+  'Use expenses_ask_my_accountant when the item is business-related but still unclear or should stay in a suspense bucket.',
+  'Use cogs_subcontractors for contractors or vendors paid to deliver client work.',
+  'Use cogs_advertising_lead_generation for lead-gen and direct-response marketing payout rails such as Steven/ST vendor payments.',
+  'Schedule C category is a hint, not the final source of truth.',
+  'If INTERNAL_TOOL_RESULTS.historyLookup shows a stable prior company classification, prefer it unless the current evidence clearly contradicts it.',
+  'If INTERNAL_TOOL_RESULTS.diagnostics.likelyReturnedItem is true, do not classify the cluster as new sales or other income.',
+  'If INTERNAL_TOOL_RESULTS.diagnostics.bankFeeCount equals the cluster transactionCount, prefer Bank Charge service instead of a transfer classification.',
+  'If INTERNAL_TOOL_RESULTS.diagnostics.likelyVendorRefund is true, prefer a refund/credit treatment over new sales unless there is strong contrary evidence.',
+  'If the evidence is mixed, the amount is large, or the current guess could reasonably be wrong, set needsUserConfirmation to true.',
+  'Keep reasons short and specific.',
+  'Always emit a record_cluster_decisions tool call with one entry per cluster shown in the user message. Do not return prose.',
+].join('\n');
+
+function buildVerifierTool(configuredClassifications) {
+  const allowedIds = configuredClassifications.map((entry) => entry.id);
+  return {
+    name: 'record_cluster_decisions',
+    description: 'Record one classification decision per cluster shown in the user message.',
+    input_schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['clusterDecisions'],
+      properties: {
+        clusterDecisions: {
+          type: 'array',
+          description: 'One decision per cluster, in the order presented.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['clusterKey', 'classificationId', 'confidence', 'needsUserConfirmation', 'reason', 'alternatives'],
+            properties: {
+              clusterKey: { type: 'string', description: 'Verbatim clusterKey from the input' },
+              classificationId: {
+                type: 'string',
+                enum: allowedIds,
+                description: 'One of the allowed classification ids',
+              },
+              confidence: { type: 'number', description: '0..1 calibrated confidence' },
+              needsUserConfirmation: { type: 'boolean' },
+              reason: { type: 'string', description: 'Short, specific reason' },
+              alternatives: {
+                type: 'array',
+                items: { type: 'string', enum: allowedIds },
+                description: 'Up to 2 alternative classification ids worth surfacing for review',
+              },
             },
           },
         },
       },
     },
   };
+}
 
-  const prompt = [
-    'You are a senior bookkeeper performing a second-pass category review for bank-statement clusters before a professional cash-basis P&L is built.',
-    batchCount > 1
-      ? `This is verifier batch ${batchIndex + 1} of ${batchCount}. Only return decisions for the clusters shown in this batch.`
-      : 'Return decisions only for the clusters shown below.',
-    'Choose exactly one classificationId from the allowed chart of accounts for each cluster.',
-    'Do not invent new accounts, sections, or ids.',
-    'You also receive INTERNAL_TOOL_RESULTS from deterministic bookkeeping helpers. Treat these as evidence, not as suggestions from another model.',
-    'Use ignore_transfer for internal transfers, credit-card payments, balance-sheet activity, owner movements, or loan activity.',
-    'Trust-company wires, attorney payments, law firms, retainers, and professional advisory/consulting vendors can still be Legal & Professional Fees even when the bank memo contains wire or transfer wording.',
-    'Use expenses_ask_my_accountant when the item is business-related but still unclear or should stay in a suspense bucket.',
-    'Use cogs_subcontractors for contractors or vendors paid to deliver client work.',
-    'Use cogs_advertising_lead_generation for lead-gen and direct-response marketing payout rails such as Steven/ST vendor payments.',
-    'Schedule C category is a hint, not the final source of truth.',
-    'If INTERNAL_TOOL_RESULTS.historyLookup shows a stable prior company classification, prefer it unless the current evidence clearly contradicts it.',
-    'If INTERNAL_TOOL_RESULTS.diagnostics.likelyReturnedItem is true, do not classify the cluster as new sales or other income.',
-    'If INTERNAL_TOOL_RESULTS.diagnostics.bankFeeCount equals the cluster transactionCount, prefer Bank Charge service instead of a transfer classification.',
-    'If INTERNAL_TOOL_RESULTS.diagnostics.likelyVendorRefund is true, prefer a refund/credit treatment over new sales unless there is strong contrary evidence.',
-    'If the evidence is mixed, the amount is large, or the current guess could reasonably be wrong, set needsUserConfirmation to true.',
-    'Keep reasons short and specific.',
-    '',
-    'ALLOWED_CLASSIFICATIONS:',
-    JSON.stringify(configuredClassifications, null, 2),
+async function requestProfessionalVerifierBatchDecisions(
+  candidates,
+  companyProfile = null,
+  batchIndex = 0,
+  batchCount = 1,
+) {
+  if (!anthropic) {
+    return [];
+  }
+
+  const configuredClassifications = getConfiguredProfessionalVerifierClassifications(companyProfile);
+  const tool = buildVerifierTool(configuredClassifications);
+
+  const systemBlocks = [
+    {
+      type: 'text',
+      text: VERIFIER_SYSTEM_INSTRUCTIONS,
+    },
+    {
+      type: 'text',
+      text: `ALLOWED_CLASSIFICATIONS:\n${JSON.stringify(configuredClassifications, null, 2)}`,
+      cache_control: { type: 'ephemeral' },
+    },
+  ];
+
+  const batchHeader = batchCount > 1
+    ? `This is verifier batch ${batchIndex + 1} of ${batchCount}. Return decisions only for the clusters in this batch.`
+    : 'Return decisions for every cluster below.';
+
+  const userText = [
+    batchHeader,
     '',
     'CLUSTERS_TO_REVIEW:',
     JSON.stringify(candidates.map((cluster) => ({
@@ -4324,28 +4449,34 @@ async function requestProfessionalVerifierBatchDecisions(
   ].join('\n');
 
   const response = await withTimeout(
-    openai.responses.create({
-      model: OPENAI_MODEL,
-      input: prompt,
-      text: {
-        format: {
-          type: 'json_schema',
-          name: 'professional_pl_cluster_decisions',
-          strict: true,
-          schema,
+    anthropic.messages.create({
+      model: ANTHROPIC_MODEL,
+      max_tokens: 8000,
+      system: systemBlocks,
+      tools: [tool],
+      tool_choice: { type: 'tool', name: tool.name },
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'text', text: userText }],
         },
-      },
+      ],
     }),
-    OPENAI_TIMEOUT_MS,
-    `OpenAI verifier timed out after ${Math.round(OPENAI_TIMEOUT_MS / 1000)} seconds`,
+    ANTHROPIC_VERIFIER_TIMEOUT_MS,
+    `Claude verifier timed out after ${Math.round(ANTHROPIC_VERIFIER_TIMEOUT_MS / 1000)} seconds`,
   );
 
-  const payload = parseStructuredExtractionPayload(response.output_text || '');
-  return Array.isArray(payload?.clusterDecisions) ? payload.clusterDecisions : [];
+  const toolUseBlock = (response.content || []).find((block) => block?.type === 'tool_use' && block?.name === tool.name);
+  if (!toolUseBlock || !toolUseBlock.input) {
+    return [];
+  }
+
+  const decisions = Array.isArray(toolUseBlock.input.clusterDecisions) ? toolUseBlock.input.clusterDecisions : [];
+  return decisions;
 }
 
 async function requestProfessionalVerifierDecisions(candidates, companyProfile = null) {
-  const batches = chunkArray(candidates, OPENAI_VERIFIER_BATCH_SIZE);
+  const batches = chunkArray(candidates, ANTHROPIC_VERIFIER_BATCH_SIZE);
   const decisions = [];
   let partialFailure = null;
 
@@ -4382,8 +4513,8 @@ async function runProfessionalOpenAiVerifier(
 ) {
   const strictReview = isStrictProfessionalReviewMode(reviewMode);
   const summary = {
-    enabled: Boolean(openai),
-    model: openai ? OPENAI_MODEL : null,
+    enabled: Boolean(anthropic),
+    model: anthropic ? ANTHROPIC_MODEL : null,
     reviewMode: normalizeProfessionalReviewMode(reviewMode),
     strictReview,
     batchCount: 0,
@@ -4398,7 +4529,7 @@ async function runProfessionalOpenAiVerifier(
     reviewSuggestions: [],
   };
 
-  if (!openai) {
+  if (!anthropic) {
     return summary;
   }
 
@@ -4483,7 +4614,7 @@ async function runProfessionalOpenAiVerifier(
         transaction.classificationMeta = {
           ...transaction.classificationMeta,
           verifierConsidered: true,
-          verifierModel: OPENAI_MODEL,
+          verifierModel: ANTHROPIC_MODEL,
           verifierClusterKey: candidate.key,
           verifierClusterLabel: candidate.label,
           verifierSuggestedClassificationId: classification.id,
@@ -6239,6 +6370,63 @@ function buildReportStatementMetas(statementMetas = []) {
   return Array.from(uniqueStatements.values()).sort(compareStatementSources);
 }
 
+const STATEMENT_RECONCILIATION_TOLERANCE = 0.5;
+
+function computeStatementReconciliations(classifiedTransactions, normalizedStatementMetas) {
+  const txsByFile = new Map();
+  for (const tx of classifiedTransactions) {
+    const key = normalizeWhitespace(tx.sourceFile);
+    if (!key) continue;
+    if (!txsByFile.has(key)) txsByFile.set(key, []);
+    txsByFile.get(key).push(tx);
+  }
+
+  const reconciliations = [];
+  for (const meta of normalizedStatementMetas) {
+    const opening = typeof meta.openingBalance === 'number' && Number.isFinite(meta.openingBalance) ? meta.openingBalance : null;
+    const closing = typeof meta.closingBalance === 'number' && Number.isFinite(meta.closingBalance) ? meta.closingBalance : null;
+    if (opening == null || closing == null) continue;
+
+    const txs = txsByFile.get(normalizeWhitespace(meta.sourceFile)) || [];
+    if (txs.length === 0) continue;
+
+    let deposits = 0;
+    let deductions = 0;
+    for (const tx of txs) {
+      const amount = Math.abs(Number(tx.amount) || 0);
+      if (tx.type === 'deposit') deposits += amount;
+      else if (tx.type === 'deduction') deductions += amount;
+    }
+
+    // Liability accounts (credit cards, loans) increase with charges (deductions)
+    // and decrease with payments (deposits). Asset accounts are the inverse.
+    const accountTypeText = `${meta.accountType || ''} ${meta.sourceAccountType || ''}`.toLowerCase();
+    const isLiabilityAccount = /credit card|credit-card|credit_card|\bloan\b|line of credit/i.test(accountTypeText);
+
+    const expectedChange = closing - opening;
+    const extractedChange = isLiabilityAccount ? deductions - deposits : deposits - deductions;
+    const delta = roundCurrency(expectedChange - extractedChange);
+    const withinTolerance = Math.abs(delta) <= STATEMENT_RECONCILIATION_TOLERANCE;
+
+    reconciliations.push({
+      sourceFile: meta.sourceFile,
+      sourceLabel: meta.sourceAccountLabel || meta.accountName || meta.sourceFile,
+      accountType: meta.accountType || meta.sourceAccountType || '',
+      isLiabilityAccount,
+      openingBalance: roundCurrency(opening),
+      closingBalance: roundCurrency(closing),
+      depositsTotal: roundCurrency(deposits),
+      deductionsTotal: roundCurrency(deductions),
+      expectedChange: roundCurrency(expectedChange),
+      extractedChange: roundCurrency(extractedChange),
+      delta,
+      withinTolerance,
+    });
+  }
+
+  return reconciliations;
+}
+
 function buildProfessionalAudit(
   classifiedTransactions,
   excludedTransactions,
@@ -6301,6 +6489,9 @@ function buildProfessionalAudit(
     if (meta.verifierAutoApplied) counts.verifierAutoAppliedCount += 1;
   }
 
+  const reconciliations = computeStatementReconciliations(classifiedTransactions, normalizedStatementMetas);
+  const reconciliationFailures = reconciliations.filter((entry) => !entry.withinTolerance);
+
   return {
     overviewStats: [
       { label: 'Transactions extracted', value: classifiedTransactions.length, format: 'count' },
@@ -6309,6 +6500,8 @@ function buildProfessionalAudit(
       { label: 'Calendar months covered', value: coverageAudit.coveredMonthCount, format: 'count' },
       { label: 'Coverage alerts', value: coverageAudit.alerts.length, format: 'count' },
       { label: 'Statements with balances', value: statementsWithBalances, format: 'count' },
+      { label: 'Statements reconciled to balance', value: reconciliations.length - reconciliationFailures.length, format: 'count' },
+      { label: 'Reconciliation mismatches', value: reconciliationFailures.length, format: 'count' },
       { label: 'Statements missing period data', value: coverageAudit.statementsMissingPeriodData, format: 'count' },
       { label: 'Included in final P&L', value: classifiedTransactions.length - excludedTransactions.length, format: 'count' },
       { label: 'Excluded from final P&L', value: excludedTransactions.length, format: 'count' },
@@ -6366,9 +6559,14 @@ function buildProfessionalAudit(
       isStrictProfessionalReviewMode(reviewMode)
         ? 'Strict review mode was enabled, so the professional P&L paused for any material or unclear cluster instead of auto-applying verifier remaps.'
         : 'Standard review mode was enabled, so previously approved rules and high-confidence verifier remaps could auto-apply before final review.',
+      reconciliations.length > 0
+        ? reconciliationFailures.length === 0
+          ? `Reconciled ${reconciliations.length.toLocaleString()} statement(s) against opening/closing balances within ±$${STATEMENT_RECONCILIATION_TOLERANCE.toFixed(2)}.`
+          : `Reconciliation flagged ${reconciliationFailures.length.toLocaleString()} of ${reconciliations.length.toLocaleString()} statement(s) where extracted activity does not match opening/closing balances. Review reconciliationAlerts before treating the report as final.`
+        : 'No statements had both an opening and closing balance available, so balance-based reconciliation was skipped.',
       verifierSummary?.warning
         ? verifierSummary.warning
-        : 'The professional statement combines Gemini extraction, deterministic local rules, and the current review workflow.',
+        : 'The professional statement combines Claude extraction, deterministic local rules, and the current review workflow.',
       'Final formulas: Gross Profit = Income - Cost of Goods Sold. Net Operating Income = Gross Profit - Expenses. Net Income = Net Operating Income + (Other Income - Other Expenses).',
     ],
     formulaBreakdown: [
@@ -6380,6 +6578,18 @@ function buildProfessionalAudit(
     ],
     transferClusters: buildTransferAuditClusters(classifiedTransactions),
     coverageAlerts: coverageAudit.alerts,
+    statementReconciliations: reconciliations,
+    reconciliationAlerts: reconciliationFailures.map((entry) => ({
+      sourceFile: entry.sourceFile,
+      sourceLabel: entry.sourceLabel,
+      accountType: entry.accountType,
+      openingBalance: entry.openingBalance,
+      closingBalance: entry.closingBalance,
+      expectedChange: entry.expectedChange,
+      extractedChange: entry.extractedChange,
+      delta: entry.delta,
+      message: `Reconciliation off by ${formatSignedCurrency(entry.delta)} on ${entry.sourceLabel || entry.sourceFile}: extracted change ${formatSignedCurrency(entry.extractedChange)} vs expected ${formatSignedCurrency(entry.expectedChange)} from statement balances. Verify no transactions were skipped during extraction.`,
+    })),
     reviewDecisions: Array.isArray(reviewSummary?.answers)
       ? reviewSummary.answers.map((answer) => ({
         questionTitle: answer.questionTitle,
@@ -6707,8 +6917,8 @@ app.delete('/api/professional-settings/review-rules/:id', (req, res) => {
 
 app.post('/api/upload', upload.array('statements', 20), (req, res) => {
   try {
-    if (!GEMINI_API_KEY) {
-      return res.status(500).json({ error: 'GEMINI_API_KEY is not configured on the server' });
+    if (!ANTHROPIC_API_KEY) {
+      return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not configured on the server' });
     }
 
     if (!req.files || req.files.length === 0) {
@@ -6890,7 +7100,7 @@ async function processJob(jobId, files, analysisMode, reviewMode = null, company
       job.progress = 100;
       job.data = report;
       job.status = 'error';
-      job.error = 'All uploaded statements failed during AI extraction. Check the Gemini model, API key, or request timeout and try again.';
+      job.error = 'All uploaded statements failed during AI extraction. Check the Claude model, API key, or request timeout and try again.';
       job.updatedAt = new Date().toISOString();
     } else if (analysisMode === PROFESSIONAL_MODE) {
       const sanitizedTransactions = sanitizeTransactions(allTransactions);
