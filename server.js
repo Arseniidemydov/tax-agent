@@ -53,6 +53,10 @@ const ANTHROPIC_VERIFIER_TIMEOUT_MS = Number.parseInt(process.env.ANTHROPIC_VERI
 const ANTHROPIC_VERIFIER_BATCH_SIZE = Math.max(1, Number.parseInt(process.env.ANTHROPIC_VERIFIER_BATCH_SIZE || '6', 10) || 6);
 const OPENAI_VERIFIER_MIN_CLUSTER_AMOUNT = Number.parseFloat(process.env.OPENAI_VERIFIER_MIN_CLUSTER_AMOUNT || '750');
 const OPENAI_VERIFIER_AUTO_APPLY_CONFIDENCE = Number.parseFloat(process.env.OPENAI_VERIFIER_AUTO_APPLY_CONFIDENCE || '0.88');
+// Phase 7.8: anything below this confidence is force-routed to Ask My
+// Accountant instead of being kept in a real bucket. Real P&L lines stay
+// clean and the AMA queue becomes a deliberate review surface.
+const VERIFIER_AMA_FALLBACK_CONFIDENCE = Number.parseFloat(process.env.VERIFIER_AMA_FALLBACK_CONFIDENCE || '0.55');
 const COMPANY_PROFILES_STORE_PATH = path.join(projectRoot, 'data', 'company-profiles.json');
 const COMPANY_PROFILES_STORE_VERSION = 1;
 const CHART_OF_ACCOUNTS_STORE_PATH = path.join(projectRoot, 'data', 'chart-of-accounts.json');
@@ -3686,6 +3690,7 @@ function isVerifierPriorityGroup(group = '') {
     'Bank Charge service',
     'Computer and Internet',
     'Legal & Professional Fees',
+    'Meals and Entertainment',
     'Other Expense',
     'Subcontractors',
     'Telephone Expense',
@@ -4306,7 +4311,10 @@ function buildProfessionalVerifierCandidates(transactions, reviewMode = PROFESSI
         || toolContext.diagnostics.likelyReturnedItem
         || toolContext.diagnostics.likelyVendorRefund
         || highImpact
-        || (cluster.priorityGroupCount > 0 && cluster.totalAmount >= 250)
+        // Phase 7.4: any cluster currently sitting in a known high-drift bucket
+        // is a verifier candidate regardless of amount. The total-cluster cap
+        // (MAX_OPENAI_VERIFIER_CLUSTERS) still bounds the per-run cost.
+        || cluster.priorityGroupCount > 0
         || strictMaterialCluster
       );
       const priorityScore = (
@@ -4551,6 +4559,7 @@ async function runProfessionalOpenAiVerifier(
     reviewSuggestedClusterCount: 0,
     stabilitySuppressedClusterCount: 0,
     stabilityHeldClusterCount: 0,
+    askMyAccountantForcedClusterCount: 0,
     warning: null,
     reviewSuggestions: [],
   };
@@ -4595,12 +4604,31 @@ async function runProfessionalOpenAiVerifier(
       const candidate = clusterKey ? candidateByKey.get(clusterKey) : null;
       if (!candidate) continue;
 
-      const classificationId = normalizeWhitespace(rawDecision?.classificationId);
-      const classification = getConfiguredProfessionalVerifierClassificationById(classificationId, companyProfile);
-      if (!classification) continue;
+      const rawClassificationId = normalizeWhitespace(rawDecision?.classificationId);
+      const verifierChosenClassification = getConfiguredProfessionalVerifierClassificationById(rawClassificationId, companyProfile);
+      if (!verifierChosenClassification) continue;
 
       const confidence = clampVerifierConfidence(rawDecision?.confidence);
       const reason = normalizeWhitespace(rawDecision?.reason);
+
+      // Phase 7.8 — AMA lane. A verifier pick under the fallback floor is
+      // automatically rerouted to Ask My Accountant so the real P&L lines
+      // stay clean. The verifier's own pick stays visible in the audit so
+      // the accountant can see what the model would have done.
+      const askMyAccountantClassification = getConfiguredProfessionalVerifierClassificationById('expenses_ask_my_accountant', companyProfile);
+      const forcedToAskMyAccountant = Boolean(
+        askMyAccountantClassification
+        && confidence < VERIFIER_AMA_FALLBACK_CONFIDENCE
+        && verifierChosenClassification.id !== 'expenses_ask_my_accountant'
+        // We never demote an Ignore decision (transfers, balance-sheet activity)
+        // to AMA — those need to stay out of the P&L entirely.
+        && !isIgnoreLikeClassification(verifierChosenClassification),
+      );
+      const classification = forcedToAskMyAccountant
+        ? askMyAccountantClassification
+        : verifierChosenClassification;
+      const classificationId = classification.id;
+
       const alternatives = Array.from(new Set(
         Array.isArray(rawDecision?.alternatives)
           ? rawDecision.alternatives.map((value) => normalizeWhitespace(value)).filter(Boolean)
@@ -4632,6 +4660,9 @@ async function runProfessionalOpenAiVerifier(
       } else if (stabilityHeld) {
         summary.stabilityHeldClusterCount += 1;
       }
+      if (forcedToAskMyAccountant) {
+        summary.askMyAccountantForcedClusterCount += 1;
+      }
 
       for (const transactionIndex of candidate.transactionIndexes) {
         const transaction = transactions[transactionIndex];
@@ -4656,6 +4687,8 @@ async function runProfessionalOpenAiVerifier(
           verifierStabilitySuppressed: stabilitySuppressed,
           verifierStabilityHeld: stabilityHeld,
           verifierStabilityNotes: stabilityGuard.notes,
+          verifierForcedToAskMyAccountant: forcedToAskMyAccountant,
+          verifierOriginalClassificationId: forcedToAskMyAccountant ? verifierChosenClassification.id : null,
         };
 
         if (shouldAutoApply) {
@@ -6543,6 +6576,7 @@ function buildProfessionalAudit(
       { label: 'Refund / return diagnostics used', value: verifierSummary?.diagnosticClusterCount || 0, format: 'count' },
       { label: 'Unstable remaps suppressed', value: verifierSummary?.stabilitySuppressedClusterCount || 0, format: 'count' },
       { label: 'Drift-prone remaps held', value: verifierSummary?.stabilityHeldClusterCount || 0, format: 'count' },
+      { label: 'Low-confidence picks routed to Ask My Accountant', value: verifierSummary?.askMyAccountantForcedClusterCount || 0, format: 'count' },
       { label: 'OpenAI auto-mappings applied', value: verifierSummary?.autoAppliedClusterCount || 0, format: 'count' },
       { label: 'User review decisions applied', value: reviewSummary?.resolvedQuestions || 0, format: 'count' },
       { label: 'Client follow-up questions queued', value: queuedClientFollowUpCount, format: 'count' },

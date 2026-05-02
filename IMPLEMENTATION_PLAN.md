@@ -481,7 +481,12 @@ The first two waves of Phase 7 shipped together with the Claude API migration:
 
 - **7.7 (partial) Parity reporter** — `npm run parity` reads every `data/flo-parity-run*.json` snapshot and prints a per-run drift table against the canonical Flo Marketing accountant figures (income / COGS / expenses / net income), plus an optional per-bucket drift table via `--groups` covering Subcontractors, Advertising and Promotion, Legal & Professional Fees, Meals and Entertainment, Telephone Expense, Bank Charge service, and Ask My Accountant. The best run (lowest absolute net-income drift) is auto-marked. Substring filter: `npm run parity -- legal` matches all four legal-* snapshots. **Deferred:** a true *replayer* (re-run today's classifier against historical raw extractions) needs raw transactions persisted at extraction time — current dumps are post-classified, not replayable. Tracked as a follow-up.
 
-Open items: `7.4` verifier tuning, `7.5` vendor canonicalization, `7.7` parity replayer, `7.8` AMA lane.
+**Wave 4:**
+
+- **7.4 Verifier tuning for drift-prone buckets** — added `Meals and Entertainment` to the verifier priority-group list (it was the only one of the four high-drift buckets missing from `isVerifierPriorityGroup`) and dropped the `$250` amount floor for priority-group clusters: any cluster currently sitting in `Subcontractors`, `Advertising and Promotion`, `Legal & Professional Fees`, `Meals and Entertainment`, `Telephone Expense`, `Bank Charge service`, `Computer and Internet`, `Other Expense`, or `Ask My Accountant` is now a verifier candidate regardless of dollar amount. The `MAX_OPENAI_VERIFIER_CLUSTERS=18` cap still bounds per-run cost. The verifier model upgrade itself (Sonnet 4.6) was already in place from the Claude migration.
+- **7.8 Strengthen the Ask My Accountant lane** — when the verifier returns a classification with `confidence < VERIFIER_AMA_FALLBACK_CONFIDENCE` (default `0.55`), the cluster is automatically rerouted to `expenses_ask_my_accountant` instead of being kept in a real bucket. The verifier's original pick stays visible in `classificationMeta.verifierOriginalClassificationId` for audit. `Ignore`-class decisions (transfers, balance-sheet activity) are exempt — those need to stay out of the P&L entirely. Added `askMyAccountantForcedClusterCount` to the verifier summary and a new "Low-confidence picks routed to Ask My Accountant" overview stat. Configurable via the new `VERIFIER_AMA_FALLBACK_CONFIDENCE` env var.
+
+Open items: `7.5` vendor canonicalization, `7.7` parity replayer.
 
 ### 7.1 Reconcile Against Statement Balances [SHIPPED]
 
@@ -528,7 +533,7 @@ Add 8-12 hand-picked examples to the professional extraction prompt, drawn from 
 
 - Parity drift on these four buckets is closed against the Flo reference checkpoint
 
-### 7.4 Verifier Tuning For Drift-Prone Buckets
+### 7.4 Verifier Tuning For Drift-Prone Buckets [SHIPPED]
 
 Today the OpenAI verifier ([`server.js:56-57`](server.js#L56-L57)) only runs on clusters >= `$750` and uses `gpt-4o-mini`. Recurring small mis-tags accumulate into thousands of dollars of drift.
 
@@ -592,7 +597,7 @@ QuickReport PDF changes ([`server.js:7170`](server.js#L7170)):
 - A single command produces the drift table on every parity run file
 - New rule and prompt changes are validated against the harness instead of by feel
 
-### 7.8 Strengthen The Ask My Accountant Lane
+### 7.8 Strengthen The Ask My Accountant Lane [SHIPPED]
 
 `expenses_ask_my_accountant` ([`server.js:122`](server.js#L122)) is currently only an inferred destination. When the model is uncertain, it picks something - usually `Other Expense` or whichever bucket is closest - and that pollutes real lines.
 
