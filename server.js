@@ -3201,10 +3201,39 @@ function buildAdvertisingAccount(description = '') {
   return 'Advertising and Promotion';
 }
 
+// Phase 7.5 — Vendor canonicalization (Income side).
+// Collapses over-fragmented sales subaccounts onto a small payment-rail
+// vocabulary. Without this, the model invents customer-specific accounts
+// like "Sales - Marketing Services" or duplicate variants like
+// "Square Sales" vs "Sales - Square", which inflates the P&L's Sales
+// section into 20+ near-duplicate rows. Returns null if the description
+// has no payment-rail signal so the caller can leave Sales as the
+// default account.
+function canonicalizeIncomeAccount(description) {
+  const upper = (description || '').toUpperCase();
+  if (/\bSQUARE\b|\bSQ\s*\*/.test(upper)) return 'Square Sales';
+  if (/\bSTRIPE\b/.test(upper)) return 'Stripe Sales';
+  if (/\bZELLE\b/.test(upper)) return 'Zelle Sales';
+  if (/\bPAYPAL\b/.test(upper)) return 'PayPal Sales';
+  if (/\bVENMO\b/.test(upper)) return 'Venmo Sales';
+  if (/\bCASH\s*APP\b/.test(upper)) return 'Cash App Sales';
+  return 'Sales';
+}
+
 function canonicalizeProfitAndLossGrouping(section, group, account, description) {
   let nextSection = section;
   let nextGroup = normalizeWhitespace(group) || '';
   let nextAccount = normalizeWhitespace(account) || nextGroup;
+
+  if (nextSection === 'Income') {
+    // Force every income line into the canonical Sales group with a
+    // payment-rail-derived account. The customer name belongs in the
+    // ledger row's NAME column (via canonicalizeCounterpartyName), not
+    // baked into the chart of accounts.
+    nextGroup = 'Sales';
+    nextAccount = canonicalizeIncomeAccount(description);
+    return refineProfitAndLossAccount(nextSection, nextGroup, nextAccount, description);
+  }
 
   if (nextSection === 'Expenses') {
     if (/^(AUTOMOBILE EXPENSE|CAR & TRUCK|CAR AND TRUCK|VEHICLE EXPENSE|AUTO EXPENSE)$/i.test(nextGroup)) nextGroup = 'Auto Expense';

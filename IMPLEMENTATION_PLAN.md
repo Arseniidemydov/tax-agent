@@ -486,7 +486,11 @@ The first two waves of Phase 7 shipped together with the Claude API migration:
 - **7.4 Verifier tuning for drift-prone buckets** — added `Meals and Entertainment` to the verifier priority-group list (it was the only one of the four high-drift buckets missing from `isVerifierPriorityGroup`) and dropped the `$250` amount floor for priority-group clusters: any cluster currently sitting in `Subcontractors`, `Advertising and Promotion`, `Legal & Professional Fees`, `Meals and Entertainment`, `Telephone Expense`, `Bank Charge service`, `Computer and Internet`, `Other Expense`, or `Ask My Accountant` is now a verifier candidate regardless of dollar amount. The `MAX_OPENAI_VERIFIER_CLUSTERS=18` cap still bounds per-run cost. The verifier model upgrade itself (Sonnet 4.6) was already in place from the Claude migration.
 - **7.8 Strengthen the Ask My Accountant lane** — when the verifier returns a classification with `confidence < VERIFIER_AMA_FALLBACK_CONFIDENCE` (default `0.55`), the cluster is automatically rerouted to `expenses_ask_my_accountant` instead of being kept in a real bucket. The verifier's original pick stays visible in `classificationMeta.verifierOriginalClassificationId` for audit. `Ignore`-class decisions (transfers, balance-sheet activity) are exempt — those need to stay out of the P&L entirely. Added `askMyAccountantForcedClusterCount` to the verifier summary and a new "Low-confidence picks routed to Ask My Accountant" overview stat. Configurable via the new `VERIFIER_AMA_FALLBACK_CONFIDENCE` env var.
 
-Open items: `7.5` vendor canonicalization, `7.7` parity replayer.
+**Wave 5:**
+
+- **7.5 (partial) Vendor canonicalization — Income side** — added `canonicalizeIncomeAccount(description)` and a new Income branch in `canonicalizeProfitAndLossGrouping` that forces every income line into `Sales` group with a payment-rail-derived account: `Square Sales`, `Stripe Sales`, `Zelle Sales`, `PayPal Sales`, `Venmo Sales`, `Cash App Sales`, or generic `Sales`. The customer name now belongs in the ledger row's NAME column (via the existing `canonicalizeCounterpartyName`), not baked into the chart of accounts. Validated against the 12-statement test ledger: collapses 21 sales subaccounts (`Sales`, `Square Sales`, `Sales - Square`, `Zelle Sales`, `Sales - Marketing Services`, `Sales - Meraki Press USA LLC`, ...) down to 4 (`Zelle Sales $55,821`, `Square Sales $33,053`, `Sales $28,915`, `Stripe Sales $473`) with totals preserved exactly. **Deferred:** the full architectural 7.5 (a persistent per-company vendor table that grows with use, plus expense-side canonicalization) needs database-backed persistence and is a larger effort.
+
+Open items: `7.5` full vendor canonicalization (architectural), `7.7` parity replayer.
 
 ### 7.1 Reconcile Against Statement Balances [SHIPPED]
 
@@ -546,7 +550,7 @@ Today the OpenAI verifier ([`server.js:56-57`](server.js#L56-L57)) only runs on 
 - Recurring small mis-tags inside the four high-drift buckets are corrected on rerun
 - Verifier remains within the existing batching / timeout envelope
 
-### 7.5 Vendor-Name Canonicalization As A Real Pipeline Step
+### 7.5 Vendor-Name Canonicalization As A Real Pipeline Step [PARTIAL — SHIPPED]
 
 The Flo `Report Subcontractors.pdf` sample shows a clean `NAME` column (`Expresso`, `Legatmarketing`, `Denni Diaz`) separate from `MEMO/DESCRIPTION`. The current code has `inferCounterpartyName` ([`server.js:5477`](server.js#L5477)) and `canonicalizeCounterpartyName` ([`server.js:5511`](server.js#L5511)) but they are not surfaced as a first-class normalized field that the classifier consumes first.
 
