@@ -10,6 +10,7 @@ const analysisModeInputs = document.querySelectorAll('input[name="analysis-mode"
 const companySelect = document.getElementById('company-select');
 const companyCreateForm = document.getElementById('company-create-form');
 const companyNameInput = document.getElementById('company-name-input');
+const companyBusinessTypeInput = document.getElementById('company-business-type-input');
 const professionalReviewSettings = document.getElementById('professional-review-settings');
 const professionalReviewModeInputs = document.querySelectorAll('input[name="professional-review-mode"]');
 
@@ -62,6 +63,8 @@ const pnlAuditSteps = document.getElementById('pnl-audit-steps');
 const pnlAuditFormulas = document.getElementById('pnl-audit-formulas');
 const pnlAuditCoverage = document.getElementById('pnl-audit-coverage');
 const pnlAuditTransfers = document.getElementById('pnl-audit-transfers');
+const pnlAuditPersonalSection = document.getElementById('pnl-audit-personal-section');
+const pnlAuditPersonalClusters = document.getElementById('pnl-audit-personal-clusters');
 const pnlAuditReviewSection = document.getElementById('pnl-audit-review-section');
 const pnlAuditReviewDecisions = document.getElementById('pnl-audit-review-decisions');
 const pnlAuditClientSection = document.getElementById('pnl-audit-client-section');
@@ -97,6 +100,7 @@ let selectedAnalysisMode = 'simple';
 let selectedProfessionalReviewMode = 'strict';
 let selectedCompanyId = '';
 let companyProfiles = [];
+let businessTypeOptions = [];
 let renderedFileCount = 0;
 let currentJobId = null;
 let statusPollInterval = null;
@@ -333,6 +337,20 @@ function syncCompanySelect() {
   }
 }
 
+// Phase 8 follow-up: populate the business-type dropdown for the
+// create-company form. Falls back to a single "Not specified" option if
+// the server hasn't returned the catalog yet.
+function syncBusinessTypeSelect() {
+  if (!companyBusinessTypeInput) return;
+  const options = businessTypeOptions.length > 0
+    ? businessTypeOptions
+    : [{ id: 'unspecified', label: 'Not specified' }];
+  companyBusinessTypeInput.innerHTML = options.map((entry) => `
+    <option value="${escapeHtml(entry.id)}">${escapeHtml(entry.label)}</option>
+  `).join('');
+  companyBusinessTypeInput.value = 'unspecified';
+}
+
 function updateSettingsCompanyNote(settings = professionalSettings) {
   const companyName = settings?.company?.name
     || getSelectedCompanyProfile()?.name
@@ -349,10 +367,12 @@ async function loadCompanies({ preferredCompanyId = selectedCompanyId, silent = 
     }
 
     companyProfiles = Array.isArray(payload.companies) ? payload.companies : [];
+    businessTypeOptions = Array.isArray(payload.businessTypes) ? payload.businessTypes : [];
     const resolvedCompanyId = payload.selectedCompanyId || preferredCompanyId || payload.defaultCompanyId || companyProfiles[0]?.id || '';
     selectedCompanyId = resolvedCompanyId;
     saveStoredCompanyId(selectedCompanyId);
     syncCompanySelect();
+    syncBusinessTypeSelect();
     updateSettingsCompanyNote();
 
     if (!silent) {
@@ -770,6 +790,25 @@ function renderReviewQuestions(questions) {
       </label>
     `).join('');
 
+    // Phase 8 follow-up: surface the per-detection reasons array on
+    // personal_candidate_review questions so users see *why* the system
+    // flagged this cluster (mortgage-servicer match, family Zelle keyword,
+    // consumer-card payment, etc.). Other question types keep using the
+    // single "Why asked" chip.
+    const personalReasonsList = (question.type === 'personal_candidate_review'
+      && Array.isArray(question.reasons)
+      && question.reasons.length > 0)
+      ? `<div class="review-personal-reasons">
+          <div class="review-personal-reasons-title">Why we flagged this cluster${question.detectionCategoryLabel ? `: ${escapeHtml(question.detectionCategoryLabel)}` : ''}</div>
+          <ul class="review-personal-reasons-list">
+            ${question.reasons.map((reason) => `<li>${escapeHtml(reason)}</li>`).join('')}
+          </ul>
+          ${question.businessTypeLabel && question.businessTypeId !== 'unspecified'
+            ? `<div class="review-personal-reasons-hint">Business type for this company: <strong>${escapeHtml(question.businessTypeLabel)}</strong>. Your answer will be saved for this company only.</div>`
+            : '<div class="review-personal-reasons-hint">No business type set for this company. You can set one when creating a new company profile. Your answer will be saved for this company only.</div>'}
+        </div>`
+      : '';
+
     card.innerHTML = `
       <div class="review-question-topline">
         <span class="review-question-count">Question ${questionIndex + 1} of ${questions.length}</span>
@@ -786,6 +825,7 @@ function renderReviewQuestions(questions) {
         ${clusterLabel}
         ${sourceFiles}
       </div>
+      ${personalReasonsList}
       ${sampleText ? `<div class="review-samples">${sampleText}</div>` : ''}
       <div class="review-options">${optionsHtml}</div>
       <div class="review-impact-preview">${escapeHtml(buildReviewImpactPreview(question, answerState))}</div>
@@ -1348,11 +1388,13 @@ companyCreateForm.addEventListener('submit', async (event) => {
 
   setSettingsStatus('Creating company profile...', 'info');
 
+  const businessType = companyBusinessTypeInput?.value || 'unspecified';
+
   try {
     const response = await apiFetch('/api/companies', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, businessType }),
     });
     const payload = await readJsonResponse(response, 'Failed to create company profile');
     if (!response.ok) {
@@ -1361,6 +1403,7 @@ companyCreateForm.addEventListener('submit', async (event) => {
 
     const createdCompanyId = payload.company?.id || payload.selectedCompanyId || '';
     companyNameInput.value = '';
+    if (companyBusinessTypeInput) companyBusinessTypeInput.value = 'unspecified';
     await loadCompanies({ preferredCompanyId: createdCompanyId, silent: true });
     await loadProfessionalSettings({ silent: true });
     setSettingsStatus(`Created company profile "${payload.company?.name || name}".`, 'success');
@@ -1692,6 +1735,7 @@ function renderProfessionalAudit(audit = {}) {
   const formulaBreakdown = Array.isArray(audit.formulaBreakdown) ? audit.formulaBreakdown : [];
   const coverageAlerts = Array.isArray(audit.coverageAlerts) ? audit.coverageAlerts : [];
   const transferClusters = Array.isArray(audit.transferClusters) ? audit.transferClusters : [];
+  const personalExpenseClusters = Array.isArray(audit.personalExpenseClusters) ? audit.personalExpenseClusters : [];
   const reviewDecisions = Array.isArray(audit.reviewDecisions) ? audit.reviewDecisions : [];
   const clientQuestions = reviewDecisions.filter((decision) => decision.needsClientAnswer && normalizeWhitespace(decision.clientQuestion));
 
@@ -1758,6 +1802,49 @@ function renderProfessionalAudit(audit = {}) {
       </div>
     `).join('')
     : '<div class="audit-empty">No transfer-like clusters were detected in this professional run.</div>';
+
+  // Phase 8 follow-up: surface the per-company personal-expense clusters with
+  // their detection reasons. Section is hidden when no clusters were flagged
+  // (typical for a clean non-commingled business account).
+  if (pnlAuditPersonalSection && pnlAuditPersonalClusters) {
+    if (personalExpenseClusters.length > 0) {
+      pnlAuditPersonalSection.style.display = 'block';
+      const decisionBadgeFor = (decision) => {
+        if (decision === 'excluded') return { label: 'Excluded as owner draws', cls: 'excluded' };
+        if (decision === 'kept_as_business') return { label: 'Kept as business expense', cls: 'kept' };
+        if (decision === 'transfer') return { label: 'Moved to transfers', cls: 'transfer' };
+        return { label: 'Pending review', cls: 'pending' };
+      };
+      pnlAuditPersonalClusters.innerHTML = personalExpenseClusters.map((cluster) => {
+        const badge = decisionBadgeFor(cluster.decisionForThisCompany);
+        const reasons = Array.isArray(cluster.reasons) ? cluster.reasons.filter(Boolean) : [];
+        return `
+          <div class="audit-cluster-card audit-personal-card">
+            <div class="audit-cluster-topline">
+              <div class="audit-cluster-label">${escapeHtml(cluster.counterpartyLabel || cluster.categoryLabel || 'Unknown cluster')}</div>
+              <div class="audit-cluster-resolution audit-personal-badge audit-personal-badge-${escapeHtml(badge.cls)}">${escapeHtml(badge.label)}</div>
+            </div>
+            <div class="audit-cluster-meta">
+              <div class="review-meta-chip">${escapeHtml(cluster.categoryLabel || cluster.category || 'Unknown category')}</div>
+              <div class="review-meta-chip">${escapeHtml((cluster.transactionCount || 0).toLocaleString())} transaction(s)</div>
+              <div class="review-meta-chip">${escapeHtml(formatMoney(cluster.totalAmount || 0))} total</div>
+            </div>
+            ${reasons.length > 0 ? `
+              <div class="audit-cluster-copy">
+                <strong>Why flagged:</strong>
+                <ul class="audit-personal-reasons">
+                  ${reasons.map((reason) => `<li>${escapeHtml(reason)}</li>`).join('')}
+                </ul>
+              </div>
+            ` : ''}
+          </div>
+        `;
+      }).join('');
+    } else {
+      pnlAuditPersonalSection.style.display = 'none';
+      pnlAuditPersonalClusters.innerHTML = '';
+    }
+  }
 
   if (reviewDecisions.length > 0) {
     pnlAuditReviewSection.style.display = 'block';

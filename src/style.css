@@ -2048,3 +2048,89 @@ body {
     justify-content: flex-start;
   }
 }
+
+/* Phase 8 follow-up — audit panel personal-expense clusters & review-question reasons */
+
+.audit-section-copy {
+  margin: 0 0 12px 0;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+
+.audit-personal-card {
+  border-color: rgba(255, 198, 142, 0.18);
+}
+
+.audit-personal-badge {
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.audit-personal-badge-excluded {
+  background: rgba(120, 200, 144, 0.18);
+  color: #b9eecb;
+}
+
+.audit-personal-badge-kept {
+  background: rgba(170, 198, 255, 0.18);
+  color: #c4d6ff;
+}
+
+.audit-personal-badge-transfer {
+  background: rgba(180, 180, 180, 0.18);
+  color: #d0d0d8;
+}
+
+.audit-personal-badge-pending {
+  background: rgba(255, 198, 142, 0.22);
+  color: #ffd9a8;
+}
+
+.audit-personal-reasons {
+  margin: 6px 0 0 18px;
+  padding: 0;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+
+.audit-personal-reasons li {
+  margin: 2px 0;
+}
+
+.review-personal-reasons {
+  margin: 10px 0 6px 0;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(255, 198, 142, 0.08);
+  border: 1px solid rgba(255, 198, 142, 0.22);
+}
+
+.review-personal-reasons-title {
+  font-weight: 700;
+  font-size: 0.88rem;
+  color: #ffd9a8;
+  margin-bottom: 6px;
+}
+
+.review-personal-reasons-list {
+  margin: 0 0 8px 18px;
+  padding: 0;
+  color: var(--text-secondary);
+  font-size: 0.86rem;
+  line-height: 1.5;
+}
+
+.review-personal-reasons-list li {
+  margin: 2px 0;
+}
+
+.review-personal-reasons-hint {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}

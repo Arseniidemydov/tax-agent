@@ -360,6 +360,53 @@ const PROFESSIONAL_VERIFIER_CLASSIFICATION_BY_ID = Object.fromEntries(
   PROFESSIONAL_VERIFIER_CLASSIFICATIONS.map((classification) => [classification.id, classification]),
 );
 
+// Phase 8 follow-up: per-company business type. Adapts the personal-candidate
+// review question wording so the user gets context-appropriate guidance.
+// Decisions are still per-company-persisted; the business type only changes
+// the explanation text, never the default option or the persistence behavior.
+const BUSINESS_TYPES = [
+  {
+    id: 'unspecified',
+    label: 'Not specified',
+    hint: 'Whether the cluster is personal or business depends on this business.',
+  },
+  {
+    id: 'service',
+    label: 'Service business / consulting / agency',
+    hint: 'For most service businesses, residential mortgages, family Zelles, and lifestyle merchants are usually personal owner spend.',
+  },
+  {
+    id: 'real_estate',
+    label: 'Real-estate investment / property management',
+    hint: 'For real-estate businesses, residential mortgages can be legitimate business expenses on rental property; review case by case.',
+  },
+  {
+    id: 'retail',
+    label: 'Retail / e-commerce / product sales',
+    hint: 'For retail businesses, lifestyle merchant purchases can sometimes be inventory or wholesale; consumer subscriptions still tend to be personal.',
+  },
+  {
+    id: 'restaurant',
+    label: 'Restaurant / hospitality / food service',
+    hint: 'For restaurant businesses, restaurant-merchant POS purchases can be cost-of-goods (sourcing, market research, comp meals); review case by case.',
+  },
+  {
+    id: 'other',
+    label: 'Other / mixed',
+    hint: 'Whether the cluster is personal or business depends on the specifics of this operation.',
+  },
+];
+const BUSINESS_TYPES_BY_ID = Object.fromEntries(BUSINESS_TYPES.map((entry) => [entry.id, entry]));
+
+function normalizeBusinessTypeId(value) {
+  const candidate = normalizeWhitespace(value).toLowerCase().replace(/[\s-]+/g, '_');
+  return BUSINESS_TYPES_BY_ID[candidate] ? candidate : 'unspecified';
+}
+
+function getBusinessTypeEntry(companyProfile) {
+  return BUSINESS_TYPES_BY_ID[normalizeBusinessTypeId(companyProfile?.businessType)] || BUSINESS_TYPES_BY_ID.unspecified;
+}
+
 function createEmptyChartOfAccountsStore() {
   return {
     version: CHART_OF_ACCOUNTS_STORE_VERSION,
@@ -751,6 +798,7 @@ function normalizeCompanyId(value) {
 function createInitialCompanyProfile({
   id = 'default_company',
   name = 'Default Company',
+  businessType = 'unspecified',
   chartAccounts = [],
   reviewRules = [],
 } = {}) {
@@ -758,6 +806,7 @@ function createInitialCompanyProfile({
   return {
     id: normalizeCompanyId(id) || 'default_company',
     name: normalizeWhitespace(name) || 'Default Company',
+    businessType: normalizeBusinessTypeId(businessType),
     createdAt: timestamp,
     updatedAt: timestamp,
     chartOfAccounts: {
@@ -804,6 +853,7 @@ function normalizeCompanyProfile(rawProfile, index = 0) {
   return {
     id: normalizedId,
     name: normalizedName,
+    businessType: normalizeBusinessTypeId(rawProfile.businessType),
     createdAt: coercePersistedRuleString(rawProfile.createdAt) || new Date().toISOString(),
     updatedAt: coercePersistedRuleString(rawProfile.updatedAt) || new Date().toISOString(),
     chartOfAccounts: {
@@ -966,11 +1016,14 @@ function serializeCompanyProfileSummary(companyProfile) {
   const chartAccounts = getConfiguredProfessionalVerifierClassifications(companyProfile, { includeDisabled: true });
   const reviewRules = Array.isArray(companyProfile?.reviewRules?.rules) ? companyProfile.reviewRules.rules : [];
   const classificationHistory = Array.isArray(companyProfile?.classificationHistory?.clusters) ? companyProfile.classificationHistory.clusters : [];
+  const businessTypeEntry = getBusinessTypeEntry(companyProfile);
 
   return {
     id: companyProfile.id,
     name: companyProfile.name,
     isDefault: companyProfilesStore?.defaultCompanyId === companyProfile.id,
+    businessType: businessTypeEntry.id,
+    businessTypeLabel: businessTypeEntry.label,
     activeChartAccountCount: chartAccounts.filter((entry) => entry.enabled !== false).length,
     customChartAccountCount: chartAccounts.filter((entry) => !entry.builtIn).length,
     activeReviewRuleCount: reviewRules.filter((rule) => rule.enabled !== false).length,
@@ -989,6 +1042,7 @@ function getCompaniesPayload(selectedCompanyId = '') {
     companies: getCompanyProfiles().map(serializeCompanyProfileSummary),
     defaultCompanyId: defaultCompany?.id || null,
     selectedCompanyId: resolvedCompany?.id || null,
+    businessTypes: BUSINESS_TYPES.map(({ id, label }) => ({ id, label })),
   };
 }
 
@@ -999,6 +1053,7 @@ function createCompanyProfile(rawPayload = {}) {
   }
 
   const normalizedName = name.slice(0, 120);
+  const businessType = normalizeBusinessTypeId(rawPayload?.businessType);
   const companies = [...getCompanyProfiles()];
   const nameFingerprint = normalizedName.toUpperCase();
   if (companies.some((company) => company.name.toUpperCase() === nameFingerprint)) {
@@ -1017,6 +1072,7 @@ function createCompanyProfile(rawPayload = {}) {
   const newCompany = normalizeCompanyProfile({
     id: nextId,
     name: normalizedName,
+    businessType,
     createdAt: timestamp,
     updatedAt: timestamp,
     chartOfAccounts: {
@@ -3978,32 +4034,42 @@ function buildTransferReviewSignal(tx) {
 // Phase 8: review signal for transactions that match a known personal
 // category. Whether they ARE personal is a per-company decision — the
 // question framing makes that explicit. The user's answer persists per
-// company via the existing review-rule store.
-function buildPersonalCandidateReviewSignal(tx, detection) {
+// company via the existing review-rule store. The optional companyProfile
+// argument lets the prompt wording adapt to the company's business type.
+function buildPersonalCandidateReviewSignal(tx, detection, companyProfile = null) {
   const counterparty = canonicalizeCounterpartyName('', tx.description) || normalizeDescription(tx.description);
   const categoryLabel = detection.label || detection.category || 'personal-looking';
   const reasons = Array.isArray(detection.reasons) && detection.reasons.length > 0
     ? detection.reasons
     : [`Memo matches a ${detection.category} pattern.`];
   const currentLabel = tx.plGroup || tx.plSection || 'current classification';
+  const businessTypeEntry = getBusinessTypeEntry(companyProfile);
+  const businessTypeHint = businessTypeEntry.hint;
+  const companyName = normalizeWhitespace(companyProfile?.name) || 'this company';
 
   return {
     type: 'personal_candidate_review',
     priority: 1.5,
-    title: `How should "${counterparty}" be treated on this company's P&L?`,
-    prompt: `These transactions match a ${categoryLabel} pattern. Whether that's a business expense or an owner draw depends on this business — for example, mortgage payments are usually personal for a service business but can be business for a real-estate investor. Your answer will be saved for this company only.`,
+    title: `How should "${counterparty}" be treated on ${companyName}'s P&L?`,
+    prompt: `These transactions match a ${categoryLabel} pattern. ${businessTypeHint} Your answer will be saved for ${companyName} only.`,
     reason: reasons[0],
+    reasons,
+    detectionCategory: detection.category,
+    detectionCategoryLabel: categoryLabel,
+    detectionConfidence: detection.confidence,
+    businessTypeId: businessTypeEntry.id,
+    businessTypeLabel: businessTypeEntry.label,
     options: [
       createReviewOption(
         'exclude_owner_draw',
         'Exclude as Owner Draws / Personal',
-        `Treat ${categoryLabel} payments as owner draws / shareholder distributions for this company.`,
+        `Treat ${categoryLabel} payments as owner draws / shareholder distributions for ${companyName}.`,
         { plSection: 'Ignore', plGroup: 'Owner Draws', plAccount: 'Owner Draws / Personal' },
       ),
       createReviewOption(
         'keep_business_expense',
         `Keep as ${currentLabel}`,
-        `Treat ${categoryLabel} payments as a legitimate business expense for this company.`,
+        `Treat ${categoryLabel} payments as a legitimate business expense for ${companyName}.`,
         { plSection: tx.plSection, plGroup: tx.plGroup, plAccount: tx.plAccount },
       ),
       createReviewOption(
@@ -4157,7 +4223,7 @@ function buildGenericReviewSignal(tx) {
   };
 }
 
-function getProfessionalReviewSignal(tx) {
+function getProfessionalReviewSignal(tx, companyProfile = null) {
   const upperDescription = tx.description.toUpperCase();
   const forcedRuleApplied = Boolean(tx.classificationMeta?.forcedRuleApplied);
 
@@ -4186,7 +4252,7 @@ function getProfessionalReviewSignal(tx) {
     && tx.plSection !== 'Ignore'
     && !forcedRuleApplied
   ) {
-    return buildPersonalCandidateReviewSignal(tx, personalDetection);
+    return buildPersonalCandidateReviewSignal(tx, personalDetection, companyProfile);
   }
 
   if (tx.type === 'deduction') {
@@ -4503,7 +4569,7 @@ function buildProfessionalVerifierCandidates(transactions, reviewMode = PROFESSI
     }
 
     const cluster = clusters.get(clusterKey);
-    const signal = getProfessionalReviewSignal(tx);
+    const signal = getProfessionalReviewSignal(tx, companyProfile);
     cluster.transactionIndexes.push(index);
     cluster.transactionCount += 1;
     cluster.totalAmount = roundCurrency(cluster.totalAmount + tx.amount);
@@ -5102,12 +5168,12 @@ function buildProfessionalVerifierReviewQuestions(
   });
 }
 
-function buildProfessionalReviewQuestions(transactions, reviewMode = PROFESSIONAL_REVIEW_STANDARD) {
+function buildProfessionalReviewQuestions(transactions, reviewMode = PROFESSIONAL_REVIEW_STANDARD, companyProfile = null) {
   const strictReview = isStrictProfessionalReviewMode(reviewMode);
   const questionBuckets = new Map();
 
   transactions.forEach((tx, index) => {
-    const signal = getProfessionalReviewSignal(tx);
+    const signal = getProfessionalReviewSignal(tx, companyProfile);
     if (!signal) return;
 
     const bucketInfo = buildReviewBucketInfo(signal.type, tx);
@@ -5121,6 +5187,14 @@ function buildProfessionalReviewQuestions(transactions, reviewMode = PROFESSIONA
         title: signal.title,
         prompt: signal.prompt,
         reason: signal.reason,
+        // Phase 8 follow-up: carry personal-detection metadata through to the
+        // bucket so it ends up on the public question payload.
+        reasons: Array.isArray(signal.reasons) ? signal.reasons : (signal.reason ? [signal.reason] : []),
+        detectionCategory: signal.detectionCategory || null,
+        detectionCategoryLabel: signal.detectionCategoryLabel || null,
+        detectionConfidence: signal.detectionConfidence ?? null,
+        businessTypeId: signal.businessTypeId || null,
+        businessTypeLabel: signal.businessTypeLabel || null,
         options: signal.options,
         transactionIndexes: [],
         transactionCount: 0,
@@ -5300,6 +5374,15 @@ function getPublicReviewQuestion(question) {
     clusterLabel: question.clusterLabel,
     prompt: question.prompt,
     reason: question.reason,
+    // Phase 8 follow-up: expose the full per-detection reasons array and the
+    // detection metadata so the UI can render "Why we flagged this" detail
+    // on personal_candidate_review questions.
+    reasons: Array.isArray(question.reasons) ? question.reasons : (question.reason ? [question.reason] : []),
+    detectionCategory: question.detectionCategory || null,
+    detectionCategoryLabel: question.detectionCategoryLabel || null,
+    detectionConfidence: question.detectionConfidence ?? null,
+    businessTypeId: question.businessTypeId || null,
+    businessTypeLabel: question.businessTypeLabel || null,
     currentClassification: question.currentClassification,
     suggestedClassification: question.suggestedClassification || '',
     verifierConfidence: question.verifierConfidence ?? null,
@@ -5451,7 +5534,7 @@ async function buildProfessionalReviewState(
   const verifierQuestionTransactionIndexes = new Set(verifierQuestions.flatMap((question) => question.transactionIndexes));
   const baseQuestions = [
     ...coverageQuestions,
-    ...buildProfessionalReviewQuestions(normalizedTransactions, normalizedReviewMode)
+    ...buildProfessionalReviewQuestions(normalizedTransactions, normalizedReviewMode, companyProfile)
   ]
     .filter((question) => {
       if (question.type === 'coverage_review') {

@@ -51,6 +51,10 @@
               <span>Create New Company</span>
               <input id="company-name-input" type="text" maxlength="120" placeholder="Flo Marketing" />
             </label>
+            <label class="settings-field company-create-field">
+              <span>Business type (shapes personal-expense review wording)</span>
+              <select id="company-business-type-input" aria-label="Business type"></select>
+            </label>
             <button id="company-create-btn" class="btn btn-secondary btn-inline" type="submit">
               <span>Create Company</span>
             </button>
@@ -435,6 +439,12 @@
               <div class="audit-section">
                 <h4 class="audit-subtitle">Transfer Clusters</h4>
                 <div id="pnl-audit-transfers" class="audit-cluster-list"></div>
+              </div>
+
+              <div id="pnl-audit-personal-section" class="audit-section" style="display:none;">
+                <h4 class="audit-subtitle">Personal Expense Clusters (per-company)</h4>
+                <p class="audit-section-copy">Transactions matching known personal-spend patterns. Whether each cluster is personal or business depends on the company — decisions saved here apply only to the active company profile.</p>
+                <div id="pnl-audit-personal-clusters" class="audit-cluster-list"></div>
               </div>
 
               <div id="pnl-audit-review-section" class="audit-section" style="display:none;">
