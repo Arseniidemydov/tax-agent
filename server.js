@@ -5331,7 +5331,7 @@ function buildProfessionalCoverageReviewQuestions(
 }
 
 function canPersistReviewQuestion(question = null) {
-  return ['transfer_review', 'refund_review', 'category_conflict', 'generic_review', 'verifier_category_review'].includes(question?.type);
+  return ['transfer_review', 'refund_review', 'category_conflict', 'generic_review', 'verifier_category_review', 'personal_candidate_review'].includes(question?.type);
 }
 
 function getDefaultReviewDecisionScope(question = null) {
