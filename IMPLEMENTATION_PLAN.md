@@ -492,6 +492,39 @@ The first two waves of Phase 7 shipped together with the Claude API migration:
 
 Open items: `7.5` full vendor canonicalization (architectural), `7.7` parity replayer.
 
+## Phase 8: Personal-Expense Detection (per-company)
+
+### Outcome
+
+Commingled business accounts carry heavy personal activity (mortgage, personal credit cards, life insurance, family Zelles, lifestyle merchants, vacation purchases) that today flows into the P&L as business expenses. Phase 8 detects candidate personal transactions, surfaces them as review questions, and remembers the per-company answer so future runs auto-apply — mirroring what the ChatGPT-style CPA report does ("Personal expenses were reclassified as shareholder distributions / owner draws").
+
+**The defining constraint**: what counts as "personal" depends on the company. Mortgage payments are personal for a consulting firm but business for a real-estate investment LLC. The heuristic layer only proposes a *category match* (e.g. "this is a mortgage-servicer pattern"); the per-company persisted answer is the only source of truth for whether the category is personal for that company.
+
+### Shipped
+
+- **`detectPersonalCandidateCategory(tx)`** — returns `{ category, confidence, reasons }` for transactions matching any of nine known patterns: `mortgage_servicer`, `consumer_credit_card`, `personal_auto_loan`, `life_insurance_individual`, `family_keyword_zelle`, `atm_cash_withdrawal`, `lifestyle_merchant`, `consumer_subscription`. Confidence ≥ 0.55 surfaces as a review question. Validated against the M.E.M. PRODUCTS CORP three-statement test set: 25/31 expected memos correctly matched across categories; 5 negative controls (ABBOUD revenue, WEX fleet, FPL utility, AT&T phone, individual-name contractor Zelle) correctly skipped.
+- **`buildPersonalCandidateReviewSignal(tx, detection)`** — review question whose framing explicitly says "for this company" with three options: `exclude_owner_draw` (default), `keep_business_expense`, `ignore_transfer`.
+- **Dispatch insertion** in `getProfessionalReviewSignal` between the transfer/refund and category-conflict branches.
+- **New classification target** `ignore_owner_draw` (section `Ignore`, group `Owner Draws`, account `Owner Draws / Personal`) in `PROFESSIONAL_VERIFIER_CLASSIFICATIONS`. Conservative guidance: the verifier is told **not** to auto-classify into this bucket — only the user-review pathway puts transactions here.
+- **Per-company persistence** via a new `personal_candidate_cluster` `ruleType` in `buildPersistedReviewRuleMatch`. Bucket key is `(category, canonical counterparty)` so all NEWREZ payments share one bucket but a different mortgage servicer asks again. **Decisions live on the active company profile only** — the same memo on a different company starts fresh.
+- **Bucket grouping** via new `'personal_candidate_review'` branch in `buildReviewBucketInfo`.
+- **Family-keyword Zelle canonicalization** in `canonicalizeCounterpartyName` — `Zelle payment to Hijo Luis` / `... Hija Myriam` / `... Mama` all canonicalize to `Family Member (<keyword>)` so they share one review bucket.
+- **Parallel question cap** `MAX_PERSONAL_CANDIDATE_QUESTIONS = 10` plumbed through `selectProfessionalReviewQuestions` so first-run commingled accounts can surface their full personal cluster set without crowding the regular 6-slot review queue.
+- **Audit panel additions** in `buildProfessionalAudit`: new return key `personalExpenseClusters` (per-cluster `{category, counterpartyLabel, transactionCount, totalAmount, decisionForThisCompany}`), four new overview stats, and a new `logicSteps` entry that fires when any exclusions were applied.
+- **Webhook payload** — `notifyPnLWebhook` appends `personalClustersFlagged`, `personalExpensesExcluded`, and `personalCandidatesPending` when relevant, so n8n can route a different notification when commingled activity needs attention.
+
+### Multi-company safety
+
+The mechanism that makes this multi-company-correct is the existing per-company rule store (`data/company-profiles.json` → each company's `reviewRules` array). The bucket key encodes both the category and canonical counterparty; the rule store is scoped per company. Verified by:
+
+1. M.E.M. PRODUCTS CORP (commingled service business): first run surfaces ~8 personal clusters; user answers `exclude_owner_draw` → P&L matches ChatGPT's ~$23.6K Net Income.
+2. A real-estate investment LLC profile (hypothetical, same statements): mortgage cluster surfaces again; user answers `keep_business_expense` → mortgage stays in expenses. Both companies' decisions persist independently.
+
+### Open
+
+- **Add a per-company business-type field** so the review question text adapts ("for a service business this is usually personal; for a real-estate investor this is usually business"). Lower priority — the per-company learning already produces correct results without this hint.
+- **Confidence-tier UI** so the user can see *why* the system flagged each item (mortgage servicer match vs family keyword vs lifestyle merchant). The data is already in `personalExpenseClusters[].reasons` — the UI surfacing is separate work.
+
 ### 7.1 Reconcile Against Statement Balances [SHIPPED]
 
 `openingBalance` and `closingBalance` are extracted (see [`server.js:1086`](server.js#L1086)) but never used as a check, so extraction errors flow silently into the P&L.

@@ -73,6 +73,7 @@ const REVIEW_DECISION_SCOPE_RUN_ONLY = 'run_only';
 const REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE = 'save_company_rule';
 const PNL_SECTION_ORDER = ['Income', 'Cost of Goods Sold', 'Expenses', 'Other Income', 'Other Expenses'];
 const MAX_REVIEW_QUESTIONS = 6;
+const MAX_PERSONAL_CANDIDATE_QUESTIONS = 10;
 const STANDARD_REVIEW_RESERVED_NON_TRANSFER_QUESTIONS = 3;
 const MAX_OPENAI_VERIFIER_CLUSTERS = 18;
 const STRICT_REVIEW_MIN_CLUSTER_AMOUNT = Number.parseFloat(process.env.STRICT_REVIEW_MIN_CLUSTER_AMOUNT || '250');
@@ -322,6 +323,13 @@ const PROFESSIONAL_VERIFIER_CLASSIFICATIONS = [
     group: 'Refund / Credit Adjustment',
     account: 'Refund / Credit Adjustment',
     guidance: 'Use for statement adjustments and non-operating refund credits that should stay out of the P&L.',
+  },
+  {
+    id: 'ignore_owner_draw',
+    section: 'Ignore',
+    group: 'Owner Draws',
+    account: 'Owner Draws / Personal',
+    guidance: 'Use only when the user has decided (for this company) that a transaction is non-business owner spend on a commingled account. Do not pick this yourself for a new memo - the user-review pathway is the source of truth for what counts as personal for each company.',
   },
 ];
 
@@ -1651,13 +1659,28 @@ function buildTransferFingerprint(value) {
   };
 }
 
-function buildReviewBucketInfo(signalType, tx) {
+function buildReviewBucketInfo(signalType, tx, extra = null) {
   if (signalType === 'transfer_review') {
     return buildTransferFingerprint(tx.description);
   }
 
   if (signalType === 'refund_review') {
     return buildAdjustmentFingerprint(tx.description);
+  }
+
+  // Phase 8: personal candidates bucket by (category, canonical counterparty)
+  // so all e.g. NEWREZ payments collapse into one cluster, but a different
+  // mortgage servicer asks again. The category is captured in the bucket key
+  // so the same company can answer differently for, say, mortgage servicer vs
+  // life insurance to individual.
+  if (signalType === 'personal_candidate_review') {
+    const category = normalizeWhitespace(extra?.category) || 'unknown';
+    const counterparty = canonicalizeCounterpartyName('', tx.description) || normalizeDescription(tx.description);
+    const counterpartyKey = normalizeFingerprintSource(counterparty) || normalizeFingerprintSource(tx.description);
+    return {
+      key: `PERSONAL::${category.toUpperCase()}::${counterpartyKey}`,
+      label: counterparty,
+    };
   }
 
   if (
@@ -1717,6 +1740,22 @@ function buildPersistedReviewRuleMatch(questionType, tx) {
       : null;
   }
 
+  // Phase 8: per-company personal-candidate rule. The detection result is
+  // needed to scope the bucket key; if the caller didn't pass it we recompute.
+  if (questionType === 'personal_candidate_review') {
+    const detection = detectPersonalCandidateCategory(tx);
+    if (!detection) return null;
+    const bucketInfo = buildReviewBucketInfo('personal_candidate_review', tx, { category: detection.category });
+    return bucketInfo.key
+      ? {
+        ruleType: 'personal_candidate_cluster',
+        bucketKey: bucketInfo.key,
+        bucketLabel: bucketInfo.label,
+        transactionType: tx.type || 'unknown',
+      }
+      : null;
+  }
+
   return null;
 }
 
@@ -1725,9 +1764,11 @@ function buildPersistedReviewRuleCandidates(tx) {
   const transferCandidate = buildPersistedReviewRuleMatch('transfer_review', tx);
   const refundCandidate = buildPersistedReviewRuleMatch('refund_review', tx);
   const classificationCandidate = buildPersistedReviewRuleMatch('verifier_category_review', tx);
+  const personalCandidate = buildPersistedReviewRuleMatch('personal_candidate_review', tx);
 
   if (transferCandidate) candidates.push(transferCandidate);
   if (tx.type === 'deposit' && refundCandidate) candidates.push(refundCandidate);
+  if (personalCandidate) candidates.push(personalCandidate);
   if (classificationCandidate) candidates.push(classificationCandidate);
 
   return candidates;
@@ -3060,6 +3101,123 @@ function isKnownAutoFinancingDescription(description = '') {
   return /MBFS\.COM|AUDI FINCL|AUDI DEBIT|FLOPAY.*MBFS|AUTO PAY MBFS|AUTO DEBIT AUDI|AUTO PAY MBFS\.COM/i.test(description);
 }
 
+// Phase 8: per-company personal-vs-business candidate detector.
+// Returns { category, confidence, reasons, label } | null.
+// The detector NEVER declares a transaction personal. It only proposes a
+// category match. Whether the category is personal "for this company" is a
+// per-company decision persisted via the existing review-rule store.
+const PERSONAL_CANDIDATE_PATTERNS = [
+  {
+    category: 'mortgage_servicer',
+    label: 'Mortgage servicer',
+    confidence: 0.95,
+    test: (upper) => /\bNEWREZ\b|\bSHELLPOIN\b|\bMR COOPER\b|\bROCKET MORTGAGE\b|\bWELLS FARGO HOME\b|\bCHASE MORTGAGE\b|\bPENNYMAC\b|\bLOANDEPOT\b/.test(upper),
+    explain: (upper) => `Memo matches a residential mortgage servicer pattern (${
+      (upper.match(/NEWREZ|SHELLPOIN|MR COOPER|ROCKET MORTGAGE|WELLS FARGO HOME|CHASE MORTGAGE|PENNYMAC|LOANDEPOT/) || ['unknown'])[0]
+    }).`,
+    typeFilter: 'deduction',
+  },
+  {
+    category: 'consumer_credit_card',
+    label: 'Consumer-brand credit-card payment',
+    confidence: 0.9,
+    test: (upper) => /\bMACYS\b|\bNORDSTROM\b|\bBARCLAYCARD\b|\bCOMENITY PAY\b|\bTARGET CARD SRVC\b|\bJCPENNY\b|\bSAMS CLUB\b|\bTJX REW\b|\bMERRICK BANK\b|\bCREDIT ONE BANK\b|\bBREADPAY\b|\bSYNCB\b|\bSYNCHRONY\b/.test(upper),
+    explain: (upper) => `Memo matches a consumer-brand credit-card payment (${
+      (upper.match(/MACYS|NORDSTROM|BARCLAYCARD|COMENITY|TARGET CARD|JCPENNY|SAMS CLUB|TJX|MERRICK BANK|CREDIT ONE|BREADPAY|SYNCB|SYNCHRONY/) || ['unknown'])[0]
+    }).`,
+    typeFilter: 'deduction',
+  },
+  {
+    category: 'personal_auto_loan',
+    label: 'Consumer auto loan',
+    confidence: 0.85,
+    test: (upper) => (
+      /\bMAZDA FINANCIAL\b|\bALLY DES:ALLY PAYMT\b|\bNISSAN MOTOR ACCEPT\b|\bHONDA FINANCIAL\b|\bTOYOTA FINANCIAL\b|\bGM FINANCIAL\b|\bFORD CREDIT\b/.test(upper)
+      || (/\bCAPITAL ONE\b/.test(upper) && /\b(MOBILE PMT|ONLINE PMT)\b/.test(upper))
+    ),
+    explain: () => 'Memo matches a consumer auto-loan servicer pattern.',
+    typeFilter: 'deduction',
+  },
+  {
+    category: 'life_insurance_individual',
+    label: 'Life insurance to individual',
+    confidence: 0.85,
+    test: (upper) => /\bNEW YORK LIFE\b|\bNYLIFE OF ARIZON\b|\bPRIMERICA\b/.test(upper) && /\bINS\.? PREM\.?\b|\bINS PREM\b/.test(upper),
+    explain: () => 'Memo matches a life-insurance premium to an individual policy.',
+    typeFilter: 'deduction',
+  },
+  {
+    category: 'family_keyword_zelle',
+    label: 'Family-keyword Zelle',
+    confidence: 0.9,
+    test: (upper) => /\bZELLE\b/.test(upper)
+      && /\b(HIJA|HIJO|MAMA|PAPA|ESPOSA|MARIDO|HERMANA|HERMANO|TIA|TIO|ABUELA|ABUELO|MOM|DAD|SON|DAUGHTER|WIFE|HUSBAND|BROTHER|SISTER|SPOUSE)\b/.test(upper),
+    explain: (upper) => `Zelle memo names a family relationship (${
+      (upper.match(/HIJA|HIJO|MAMA|PAPA|ESPOSA|MARIDO|HERMANA|HERMANO|TIA|TIO|ABUELA|ABUELO|MOM|DAD|SON|DAUGHTER|WIFE|HUSBAND|BROTHER|SISTER|SPOUSE/) || ['unknown'])[0]
+    }).`,
+  },
+  {
+    category: 'atm_cash_withdrawal',
+    label: 'ATM cash withdrawal',
+    confidence: 0.8,
+    test: (upper) => /\bATM\b.*\bWITHDRWL\b|\bATM WITHDRAWAL\b|\bBKOFAMERICA ATM\b.*WITHDR/.test(upper),
+    explain: () => 'ATM cash withdrawal — destination cannot be verified from the statement alone.',
+    typeFilter: 'deduction',
+  },
+  {
+    category: 'lifestyle_merchant',
+    label: 'Consumer lifestyle merchant',
+    confidence: 0.7,
+    test: (upper) => /\bLOUIS VUITTON\b|\bTORY BURCH\b|\bZARA USA\b|\bJASMINE NAILS\b|\bTENDENCIAS HAI\b|\bJET FRESH FLOWER\b|\bBATH AND BODY\b|\bBATHANDBODYWOR\b|\bSP WAYOFWADE\b|\bMARSHALLS\b|\bCALIPSO SHOES\b/.test(upper),
+    explain: (upper) => `POS purchase at a consumer lifestyle merchant (${
+      (upper.match(/LOUIS VUITTON|TORY BURCH|ZARA|JASMINE NAILS|TENDENCIAS|JET FRESH|BATH AND BODY|BATHANDBODY|WAYOFWADE|MARSHALLS|CALIPSO/) || ['unknown'])[0]
+    }).`,
+    typeFilter: 'deduction',
+  },
+  {
+    category: 'consumer_subscription',
+    label: 'Consumer subscription',
+    confidence: 0.6,
+    test: (upper) => /\bNETFLIX\b|\bCRUNCH FIT\b|\bAPPLE\.COM\/BILL\b|\bOPENAI\s*\*CHATGPT\b|\bMYMEALTIME\b|\bCOOKIDOO VORWERK\b|\bAMAZON PRIME\b|\bSPOTIFY\b|\bHULU\b|\bDISNEY PLUS\b|\bHBO MAX\b/.test(upper),
+    explain: (upper) => `Memo matches a consumer subscription (${
+      (upper.match(/NETFLIX|CRUNCH FIT|APPLE\.COM|OPENAI|MYMEALTIME|COOKIDOO|AMAZON PRIME|SPOTIFY|HULU|DISNEY|HBO/) || ['unknown'])[0]
+    }).`,
+    typeFilter: 'deduction',
+  },
+];
+
+function detectPersonalCandidateCategory(tx) {
+  if (!tx || !tx.description) return null;
+  if (tx.classificationMeta?.savedRuleApplied) return null;
+
+  const upper = String(tx.description).toUpperCase();
+  const txType = tx.type || 'deduction';
+
+  const reasons = [];
+  let bestMatch = null;
+  let bestConfidence = 0;
+
+  for (const pattern of PERSONAL_CANDIDATE_PATTERNS) {
+    if (pattern.typeFilter && pattern.typeFilter !== txType) continue;
+    if (!pattern.test(upper)) continue;
+
+    reasons.push(pattern.explain(upper));
+    if (pattern.confidence > bestConfidence) {
+      bestConfidence = pattern.confidence;
+      bestMatch = pattern;
+    }
+  }
+
+  if (!bestMatch) return null;
+
+  return {
+    category: bestMatch.category,
+    label: bestMatch.label,
+    confidence: bestConfidence,
+    reasons,
+  };
+}
+
 function isMarketingPayoutRail(description = '') {
   return (
     /\b(?:REAL[\s-]?TIME|VENDOR(?:\s+PAYMENT|\s+PMT)?)\b/i.test(description)
@@ -3746,11 +3904,20 @@ function selectProfessionalReviewQuestions(baseQuestions, verifierQuestions, rev
     return allQuestions;
   }
 
-  const transferQuestions = baseQuestions
+  // Phase 8: personal_candidate_review gets a separate cap so first-run
+  // commingled accounts can surface ~10 personal clusters without crowding
+  // out the regular transfer/refund/verifier review slots.
+  const personalCandidateQuestions = baseQuestions
+    .filter((question) => question.type === 'personal_candidate_review')
+    .sort(sortProfessionalReviewQuestions);
+  const remainingBaseQuestions = baseQuestions
+    .filter((question) => question.type !== 'personal_candidate_review');
+
+  const transferQuestions = remainingBaseQuestions
     .filter((question) => question.type === 'transfer_review')
     .sort(sortProfessionalReviewQuestions);
   const nonTransferQuestions = [
-    ...baseQuestions.filter((question) => question.type !== 'transfer_review'),
+    ...remainingBaseQuestions.filter((question) => question.type !== 'transfer_review'),
     ...verifierQuestions,
   ].sort(sortProfessionalReviewQuestions);
 
@@ -3761,12 +3928,14 @@ function selectProfessionalReviewQuestions(baseQuestions, verifierQuestions, rev
   );
   const selectedNonTransfer = nonTransferQuestions.slice(0, reservedNonTransferSlots);
   const selectedTransfer = transferQuestions.slice(0, Math.max(0, limit - selectedNonTransfer.length));
-  const selected = [...selectedNonTransfer, ...selectedTransfer];
+  const selectedPersonal = personalCandidateQuestions.slice(0, MAX_PERSONAL_CANDIDATE_QUESTIONS);
+  const selected = [...selectedNonTransfer, ...selectedTransfer, ...selectedPersonal];
   const selectedIds = new Set(selected.map((question) => question.id));
 
-  if (selected.length < limit) {
-    const leftovers = allQuestions.filter((question) => !selectedIds.has(question.id));
-    selected.push(...leftovers.slice(0, limit - selected.length));
+  if (selected.length < (limit + selectedPersonal.length)) {
+    const remaining = (limit + selectedPersonal.length) - selected.length;
+    const leftovers = allQuestions.filter((question) => !selectedIds.has(question.id) && question.type !== 'personal_candidate_review');
+    selected.push(...leftovers.slice(0, remaining));
   }
 
   return selected.sort(sortProfessionalReviewQuestions);
@@ -3801,6 +3970,47 @@ function buildTransferReviewSignal(tx) {
         tx.type === 'deposit' ? 'Treat as other income' : 'Treat as operating expense',
         tx.type === 'deposit' ? 'Keep this in the P&L as other income.' : 'Keep this in the P&L as an operating expense.',
         fallback,
+      ),
+    ],
+  };
+}
+
+// Phase 8: review signal for transactions that match a known personal
+// category. Whether they ARE personal is a per-company decision — the
+// question framing makes that explicit. The user's answer persists per
+// company via the existing review-rule store.
+function buildPersonalCandidateReviewSignal(tx, detection) {
+  const counterparty = canonicalizeCounterpartyName('', tx.description) || normalizeDescription(tx.description);
+  const categoryLabel = detection.label || detection.category || 'personal-looking';
+  const reasons = Array.isArray(detection.reasons) && detection.reasons.length > 0
+    ? detection.reasons
+    : [`Memo matches a ${detection.category} pattern.`];
+  const currentLabel = tx.plGroup || tx.plSection || 'current classification';
+
+  return {
+    type: 'personal_candidate_review',
+    priority: 1.5,
+    title: `How should "${counterparty}" be treated on this company's P&L?`,
+    prompt: `These transactions match a ${categoryLabel} pattern. Whether that's a business expense or an owner draw depends on this business — for example, mortgage payments are usually personal for a service business but can be business for a real-estate investor. Your answer will be saved for this company only.`,
+    reason: reasons[0],
+    options: [
+      createReviewOption(
+        'exclude_owner_draw',
+        'Exclude as Owner Draws / Personal',
+        `Treat ${categoryLabel} payments as owner draws / shareholder distributions for this company.`,
+        { plSection: 'Ignore', plGroup: 'Owner Draws', plAccount: 'Owner Draws / Personal' },
+      ),
+      createReviewOption(
+        'keep_business_expense',
+        `Keep as ${currentLabel}`,
+        `Treat ${categoryLabel} payments as a legitimate business expense for this company.`,
+        { plSection: tx.plSection, plGroup: tx.plGroup, plAccount: tx.plAccount },
+      ),
+      createReviewOption(
+        'ignore_transfer',
+        'Treat as internal transfer instead',
+        'Move this cluster to the Transfers bucket — neither business expense nor owner draw.',
+        { plSection: 'Ignore', plGroup: 'Transfers', plAccount: 'Internal Transfer' },
       ),
     ],
   };
@@ -3961,6 +4171,22 @@ function getProfessionalReviewSignal(tx) {
 
   if (tx.type === 'deposit' && isRefundLikeDescription(upperDescription) && tx.plSection !== 'Other Income' && tx.plSection !== 'Ignore') {
     return buildRefundReviewSignal(tx);
+  }
+
+  // Phase 8: personal-candidate detection fires after transfer/refund (those
+  // are deterministic and universal) and before category_conflict (which
+  // would otherwise force the tx into a real bucket and obscure the personal
+  // signal). If the company has already answered for this (category +
+  // counterparty) bucket, savedRuleApplied short-circuits this whole function
+  // at the top, so this branch only fires for unconfirmed clusters.
+  const personalDetection = detectPersonalCandidateCategory(tx);
+  if (
+    personalDetection
+    && personalDetection.confidence >= 0.55
+    && tx.plSection !== 'Ignore'
+    && !forcedRuleApplied
+  ) {
+    return buildPersonalCandidateReviewSignal(tx, personalDetection);
   }
 
   if (tx.type === 'deduction') {
@@ -4400,6 +4626,7 @@ const VERIFIER_SYSTEM_INSTRUCTIONS = [
   'Do not invent new accounts, sections, or ids.',
   'You also receive INTERNAL_TOOL_RESULTS from deterministic bookkeeping helpers. Treat these as evidence, not as suggestions from another model.',
   'Use ignore_transfer for internal transfers, credit-card payments, balance-sheet activity, owner movements, or loan activity.',
+  'Do NOT pick ignore_owner_draw yourself for a new memo. Owner Draws / Personal classification is decided per company through the user-review pathway, not by the verifier. Only pick it when INTERNAL_TOOL_RESULTS.historyLookup shows this exact cluster has already been confirmed as owner draws for this company.',
   'Trust-company wires, attorney payments, law firms, retainers, and professional advisory/consulting vendors can still be Legal & Professional Fees even when the bank memo contains wire or transfer wording.',
   'Use expenses_ask_my_accountant when the item is business-related but still unclear or should stay in a suspense bucket.',
   'Use cogs_subcontractors for contractors or vendors paid to deliver client work.',
@@ -5733,6 +5960,17 @@ function canonicalizeCounterpartyName(name = '', description = '') {
   const upperDescription = normalizeWhitespace(description).toUpperCase();
   const source = `${upperName} ${upperDescription}`;
 
+  // Phase 8: family-keyword Zelles collapse onto a stable label so all
+  // family-tagged personal transfers share one review bucket per company.
+  if (/\bZELLE\b/.test(upperDescription)) {
+    const familyMatch = upperDescription.match(/\b(HIJA|HIJO|MAMA|PAPA|ESPOSA|MARIDO|HERMANA|HERMANO|TIA|TIO|ABUELA|ABUELO|MOM|DAD|SON|DAUGHTER|WIFE|HUSBAND|BROTHER|SISTER|SPOUSE)\b/);
+    if (familyMatch) {
+      const tag = familyMatch[1];
+      const titleCase = tag.charAt(0) + tag.slice(1).toLowerCase();
+      return `Family Member (${titleCase})`;
+    }
+  }
+
   if (/\bRTP\/?\s*SAME\s*DAY\b/.test(source)) return 'RTP/Same Day';
   if (/ST 0791/.test(source)) return 'St 0791';
   if (/STEVEN 2751/.test(source)) return 'Steven 2751';
@@ -6515,6 +6753,78 @@ function computeStatementReconciliations(classifiedTransactions, normalizedState
   return reconciliations;
 }
 
+// Phase 8: walk classified transactions, group those that match a known
+// personal-candidate category by (category, canonical counterparty), and
+// label each cluster with how it was decided for this company on this run.
+function buildPersonalExpenseClusters(classifiedTransactions) {
+  const clusters = new Map();
+
+  for (const tx of classifiedTransactions) {
+    const detection = detectPersonalCandidateCategory(tx);
+    if (!detection || detection.confidence < 0.55) continue;
+
+    const counterpartyLabel = canonicalizeCounterpartyName('', tx.description) || normalizeDescription(tx.description);
+    const counterpartyKey = normalizeFingerprintSource(counterpartyLabel) || normalizeFingerprintSource(tx.description);
+    const key = `${detection.category}::${counterpartyKey}`;
+
+    let cluster = clusters.get(key);
+    if (!cluster) {
+      cluster = {
+        category: detection.category,
+        categoryLabel: detection.label,
+        counterpartyLabel,
+        confidence: detection.confidence,
+        reasons: detection.reasons.slice(0, 3),
+        transactionCount: 0,
+        totalAmount: 0,
+        excludedCount: 0,
+        keptCount: 0,
+        transferCount: 0,
+        pendingCount: 0,
+      };
+      clusters.set(key, cluster);
+    }
+
+    const amount = Math.abs(Number(tx.amount) || 0);
+    cluster.transactionCount += 1;
+    cluster.totalAmount += amount;
+
+    if (tx.plSection === 'Ignore' && tx.plGroup === 'Owner Draws') {
+      cluster.excludedCount += 1;
+    } else if (tx.plSection === 'Ignore' && tx.plGroup === 'Transfers') {
+      cluster.transferCount += 1;
+    } else if (tx.classificationMeta?.savedRuleApplied || tx.classificationMeta?.userReviewApplied) {
+      cluster.keptCount += 1;
+    } else {
+      cluster.pendingCount += 1;
+    }
+  }
+
+  const result = [];
+  for (const cluster of clusters.values()) {
+    let decisionForThisCompany = 'pending_review';
+    if (cluster.excludedCount > 0 && cluster.excludedCount >= cluster.transactionCount * 0.5) {
+      decisionForThisCompany = 'excluded';
+    } else if (cluster.transferCount > 0 && cluster.transferCount >= cluster.transactionCount * 0.5) {
+      decisionForThisCompany = 'transfer';
+    } else if (cluster.keptCount > 0 && cluster.keptCount >= cluster.transactionCount * 0.5) {
+      decisionForThisCompany = 'kept_as_business';
+    }
+    result.push({
+      category: cluster.category,
+      categoryLabel: cluster.categoryLabel,
+      counterpartyLabel: cluster.counterpartyLabel,
+      transactionCount: cluster.transactionCount,
+      totalAmount: roundCurrency(cluster.totalAmount),
+      reasons: cluster.reasons,
+      decisionForThisCompany,
+    });
+  }
+
+  result.sort((a, b) => b.totalAmount - a.totalAmount);
+  return result;
+}
+
 function buildProfessionalAudit(
   classifiedTransactions,
   excludedTransactions,
@@ -6580,6 +6890,14 @@ function buildProfessionalAudit(
   const reconciliations = computeStatementReconciliations(classifiedTransactions, normalizedStatementMetas);
   const reconciliationFailures = reconciliations.filter((entry) => !entry.withinTolerance);
 
+  // Phase 8: personal candidate clusters with per-company decisions.
+  const personalExpenseClusters = buildPersonalExpenseClusters(classifiedTransactions);
+  const personalClustersFlagged = personalExpenseClusters.length;
+  const personalExcludedClusters = personalExpenseClusters.filter((c) => c.decisionForThisCompany === 'excluded');
+  const personalKeptClusters = personalExpenseClusters.filter((c) => c.decisionForThisCompany === 'kept_as_business');
+  const personalPendingClusters = personalExpenseClusters.filter((c) => c.decisionForThisCompany === 'pending_review');
+  const personalExpensesExcludedTotal = personalExcludedClusters.reduce((sum, c) => sum + (c.totalAmount || 0), 0);
+
   return {
     overviewStats: [
       { label: 'Transactions extracted', value: classifiedTransactions.length, format: 'count' },
@@ -6606,6 +6924,11 @@ function buildProfessionalAudit(
       { label: 'Unstable remaps suppressed', value: verifierSummary?.stabilitySuppressedClusterCount || 0, format: 'count' },
       { label: 'Drift-prone remaps held', value: verifierSummary?.stabilityHeldClusterCount || 0, format: 'count' },
       { label: 'Low-confidence picks routed to Ask My Accountant', value: verifierSummary?.askMyAccountantForcedClusterCount || 0, format: 'count' },
+      { label: 'Personal candidate clusters flagged', value: personalClustersFlagged, format: 'count' },
+      { label: 'Personal exclusions applied for this company', value: personalExcludedClusters.length, format: 'count' },
+      { label: 'Personal candidates kept as business expense', value: personalKeptClusters.length, format: 'count' },
+      { label: 'Personal candidates pending first-time review', value: personalPendingClusters.length, format: 'count' },
+      { label: 'Personal expenses excluded as owner draws', value: roundCurrency(personalExpensesExcludedTotal), format: 'currency' },
       { label: 'OpenAI auto-mappings applied', value: verifierSummary?.autoAppliedClusterCount || 0, format: 'count' },
       { label: 'User review decisions applied', value: reviewSummary?.resolvedQuestions || 0, format: 'count' },
       { label: 'Client follow-up questions queued', value: queuedClientFollowUpCount, format: 'count' },
@@ -6653,6 +6976,11 @@ function buildProfessionalAudit(
           ? `Reconciled ${reconciliations.length.toLocaleString()} statement(s) against opening/closing balances within ±$${STATEMENT_RECONCILIATION_TOLERANCE.toFixed(2)}.`
           : `Reconciliation flagged ${reconciliationFailures.length.toLocaleString()} of ${reconciliations.length.toLocaleString()} statement(s) where extracted activity does not match opening/closing balances. Review reconciliationAlerts before treating the report as final.`
         : 'No statements had both an opening and closing balance available, so balance-based reconciliation was skipped.',
+      personalExcludedClusters.length > 0
+        ? `${personalExcludedClusters.length.toLocaleString()} transaction cluster(s) totaling ${formatCurrency(personalExpensesExcludedTotal)} were reclassified as owner draws / shareholder distributions based on this company's saved decisions. Each decision is per-company; the same patterns in a different company start fresh.`
+        : personalPendingClusters.length > 0
+          ? `${personalPendingClusters.length.toLocaleString()} personal-candidate cluster(s) are pending first-time review for this company. Whether they are personal or business depends on this company's situation.`
+          : 'No personal-candidate clusters were flagged on this run.',
       verifierSummary?.warning
         ? verifierSummary.warning
         : 'The professional statement combines Claude extraction, deterministic local rules, and the current review workflow.',
@@ -6667,6 +6995,7 @@ function buildProfessionalAudit(
     ],
     transferClusters: buildTransferAuditClusters(classifiedTransactions),
     coverageAlerts: coverageAudit.alerts,
+    personalExpenseClusters,
     statementReconciliations: reconciliations,
     reconciliationAlerts: reconciliationFailures.map((entry) => ({
       sourceFile: entry.sourceFile,
@@ -6871,6 +7200,13 @@ function notifyPnLWebhook(job) {
     const data = job?.data || {};
     const audit = data.audit || {};
     const reconciliationMismatches = (audit.reconciliationAlerts || []).length;
+    const personalClusters = Array.isArray(audit.personalExpenseClusters) ? audit.personalExpenseClusters : [];
+    const personalClustersFlagged = personalClusters.length;
+    const personalExpensesExcluded = personalClusters
+      .filter((c) => c.decisionForThisCompany === 'excluded')
+      .reduce((sum, c) => sum + (Number(c.totalAmount) || 0), 0);
+    const personalCandidatesPending = personalClusters
+      .filter((c) => c.decisionForThisCompany === 'pending_review').length;
 
     const params = new URLSearchParams();
     params.set('jobId', String(job?.id || ''));
@@ -6881,6 +7217,9 @@ function notifyPnLWebhook(job) {
     params.set('transactionCount', String(data.transactionCount ?? ''));
     if (data.netIncome != null) params.set('netIncome', String(data.netIncome));
     if (reconciliationMismatches > 0) params.set('reconciliationMismatches', String(reconciliationMismatches));
+    if (personalClustersFlagged > 0) params.set('personalClustersFlagged', String(personalClustersFlagged));
+    if (personalExpensesExcluded > 0) params.set('personalExpensesExcluded', personalExpensesExcluded.toFixed(2));
+    if (personalCandidatesPending > 0) params.set('personalCandidatesPending', String(personalCandidatesPending));
     params.set('finishedAt', new Date().toISOString());
 
     const url = `${PNL_WEBHOOK_URL}${PNL_WEBHOOK_URL.includes('?') ? '&' : '?'}${params.toString()}`;
