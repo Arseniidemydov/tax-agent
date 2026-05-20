@@ -73,7 +73,7 @@ const REVIEW_DECISION_SCOPE_RUN_ONLY = 'run_only';
 const REVIEW_DECISION_SCOPE_SAVE_COMPANY_RULE = 'save_company_rule';
 const PNL_SECTION_ORDER = ['Income', 'Cost of Goods Sold', 'Expenses', 'Other Income', 'Other Expenses'];
 const MAX_REVIEW_QUESTIONS = 6;
-const MAX_PERSONAL_CANDIDATE_QUESTIONS = 10;
+const MAX_PERSONAL_CANDIDATE_QUESTIONS = 20;
 const STANDARD_REVIEW_RESERVED_NON_TRANSFER_QUESTIONS = 3;
 const MAX_OPENAI_VERIFIER_CLUSTERS = 18;
 const STRICT_REVIEW_MIN_CLUSTER_AMOUNT = Number.parseFloat(process.env.STRICT_REVIEW_MIN_CLUSTER_AMOUNT || '250');
@@ -2923,54 +2923,89 @@ async function extractStatementDataFromPDF(pdfBuffer, analysisMode, fileName = '
 
   let lastError = null;
   let backoffMs = 5000;
+  // Switched from messages.create to messages.stream + finalMessage so we
+  // can safely run with a 32K token budget. Anthropic's SDK guidance is
+  // that any non-streamed call above ~16K risks HTTP-timeout truncation,
+  // which manifested on the M.E.M. Jan statement (Claude returned a
+  // "success" response but with an empty transactions array). 32K gives
+  // ~190+ dense bank transactions room to fit in the tool call output
+  // without bumping into the response cap.
+  const MAX_TOKENS_PER_ATTEMPT = 32000;
 
   for (let attempt = 1; attempt <= 4; attempt += 1) {
     try {
       const startedAt = Date.now();
-      console.log(`    Sending ${analysisMode} extraction request to Claude for ${fileName} using model ${ANTHROPIC_MODEL} (${Math.round(pdfBuffer.length / 1024)} KB, timeout ${Math.round(ANTHROPIC_TIMEOUT_MS / 1000)}s)`);
+      console.log(`    Sending ${analysisMode} extraction request to Claude for ${fileName} using model ${ANTHROPIC_MODEL} (${Math.round(pdfBuffer.length / 1024)} KB, max_tokens ${MAX_TOKENS_PER_ATTEMPT}, timeout ${Math.round(ANTHROPIC_TIMEOUT_MS / 1000)}s)`);
+
+      const stream = anthropic.messages.stream({
+        model: ANTHROPIC_MODEL,
+        max_tokens: MAX_TOKENS_PER_ATTEMPT,
+        system: [
+          {
+            type: 'text',
+            text: systemPrompt,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+        tools: [tool],
+        tool_choice: { type: 'tool', name: tool.name },
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'document',
+                source: {
+                  type: 'base64',
+                  media_type: 'application/pdf',
+                  data: base64PDF,
+                },
+              },
+              {
+                type: 'text',
+                text: `Extract every transaction from ${fileName}. Use the tool to record the result.`,
+              },
+            ],
+          },
+        ],
+      });
 
       const response = await withTimeout(
-        anthropic.messages.create({
-          model: ANTHROPIC_MODEL,
-          max_tokens: 16000,
-          system: [
-            {
-              type: 'text',
-              text: systemPrompt,
-              cache_control: { type: 'ephemeral' },
-            },
-          ],
-          tools: [tool],
-          tool_choice: { type: 'tool', name: tool.name },
-          messages: [
-            {
-              role: 'user',
-              content: [
-                {
-                  type: 'document',
-                  source: {
-                    type: 'base64',
-                    media_type: 'application/pdf',
-                    data: base64PDF,
-                  },
-                },
-                {
-                  type: 'text',
-                  text: `Extract every transaction from ${fileName}. Use the tool to record the result.`,
-                },
-              ],
-            },
-          ],
-        }),
+        stream.finalMessage(),
         ANTHROPIC_TIMEOUT_MS,
         `Claude request timed out after ${Math.round(ANTHROPIC_TIMEOUT_MS / 1000)}s for ${fileName}`,
       );
 
-      console.log(`    Claude responded for ${fileName} in ${((Date.now() - startedAt) / 1000).toFixed(1)}s (cache_read=${response.usage?.cache_read_input_tokens ?? 0}, cache_write=${response.usage?.cache_creation_input_tokens ?? 0})`);
+      const stopReason = response.stop_reason;
+      console.log(`    Claude responded for ${fileName} in ${((Date.now() - startedAt) / 1000).toFixed(1)}s (stop=${stopReason}, cache_read=${response.usage?.cache_read_input_tokens ?? 0}, cache_write=${response.usage?.cache_creation_input_tokens ?? 0})`);
 
       const toolUseBlock = (response.content || []).find((block) => block?.type === 'tool_use' && block?.name === tool.name);
       if (!toolUseBlock || !toolUseBlock.input) {
         throw new Error(`Claude response missing the ${tool.name} tool call for ${fileName}.`);
+      }
+
+      // Catch the silent-empty failure mode (response succeeds but Claude
+      // returns zero transactions on a non-empty statement). If the opening
+      // and closing balances disagree, an empty transaction list cannot
+      // possibly be correct — retry. This made the M.E.M. Jan statement
+      // come back empty on the first attempt under the old 16K budget.
+      const extractedTransactions = Array.isArray(toolUseBlock.input?.transactions)
+        ? toolUseBlock.input.transactions
+        : [];
+      const meta = toolUseBlock.input?.statementMeta || {};
+      const opening = typeof meta.openingBalance === 'number' ? meta.openingBalance : null;
+      const closing = typeof meta.closingBalance === 'number' ? meta.closingBalance : null;
+      const looksEmptyButShouldNotBe = (
+        extractedTransactions.length === 0
+        && opening != null
+        && closing != null
+        && Math.abs(closing - opening) > 0.5
+      );
+      if (looksEmptyButShouldNotBe) {
+        throw new Error(`Claude returned 0 transactions for ${fileName} but the statement balance changed by ${(closing - opening).toFixed(2)}; likely hit the output-token ceiling. Retrying.`);
+      }
+      if (stopReason === 'max_tokens' && extractedTransactions.length === 0) {
+        throw new Error(`Claude hit max_tokens for ${fileName} before emitting any transactions. Retrying.`);
       }
 
       return normalizeExtractionResult(toolUseBlock.input, fileName);
@@ -2981,7 +3016,8 @@ async function extractStatementDataFromPDF(pdfBuffer, analysisMode, fileName = '
       const isRateLimit = status === 429 || /rate[_ ]?limit/i.test(message);
       const isOverloaded = status === 529 || status === 503 || /overloaded/i.test(message);
       const isTimeout = /timed out/i.test(message);
-      const isRetriable = isRateLimit || isOverloaded || isTimeout || (status >= 500 && status < 600);
+      const isEmptySuspect = /returned 0 transactions|hit max_tokens/i.test(message);
+      const isRetriable = isRateLimit || isOverloaded || isTimeout || isEmptySuspect || (status >= 500 && status < 600);
 
       if (!isRetriable || attempt === 4) {
         throw err;
@@ -5214,7 +5250,7 @@ function buildProfessionalReviewQuestions(transactions, reviewMode = PROFESSIONA
     if (tx.sourceFile) bucket.sourceFiles.add(tx.sourceFile);
   });
 
-  return Array.from(questionBuckets.values())
+  const allBuckets = Array.from(questionBuckets.values())
     .map((bucket, idx) => ({
       ...bucket,
       id: `review_${idx + 1}`,
@@ -5226,10 +5262,27 @@ function buildProfessionalReviewQuestions(transactions, reviewMode = PROFESSIONA
       totalAmount: roundCurrency(bucket.totalAmount),
       sampleDescriptions: Array.from(bucket.sampleDescriptions).slice(0, 3),
       sourceFiles: Array.from(bucket.sourceFiles),
-    }))
+    }));
+
+  // Phase 8 follow-up: personal_candidate_review skips the size threshold —
+  // small single-tx personal items (e.g. a $20 Netflix subscription, a $24
+  // Crunch Fit charge) need to surface for first-time confirmation too,
+  // because once persisted as Owner Draws the rule auto-applies forever.
+  // The selectProfessionalReviewQuestions caller still enforces
+  // MAX_PERSONAL_CANDIDATE_QUESTIONS so the queue stays bounded.
+  const personalBuckets = allBuckets
+    .filter((bucket) => bucket.type === 'personal_candidate_review')
+    .sort((a, b) => b.totalAmount - a.totalAmount)
+    .slice(0, MAX_PERSONAL_CANDIDATE_QUESTIONS);
+
+  const nonPersonalBuckets = allBuckets
+    .filter((bucket) => bucket.type !== 'personal_candidate_review')
     .filter((bucket) => strictReview || bucket.transactionCount > 1 || bucket.totalAmount >= 250)
     .sort((a, b) => a.priority - b.priority || b.totalAmount - a.totalAmount)
     .slice(0, getProfessionalReviewQuestionLimit(reviewMode));
+
+  return [...personalBuckets, ...nonPersonalBuckets]
+    .sort((a, b) => a.priority - b.priority || b.totalAmount - a.totalAmount);
 }
 
 function buildProfessionalCoverageReviewQuestions(
