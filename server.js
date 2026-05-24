@@ -5294,7 +5294,8 @@ function buildProfessionalCoverageReviewQuestions(
     return [];
   }
 
-  const coverageAudit = buildStatementCoverageAudit(statementMetas);
+  const reportingPeriod = detectReportingPeriod(statementMetas);
+  const coverageAudit = buildStatementCoverageAudit(statementMetas, reportingPeriod);
   const accountSignals = Array.isArray(coverageAudit.accountSignals) ? coverageAudit.accountSignals : [];
   if (accountSignals.length === 0) {
     return [];
@@ -5508,7 +5509,7 @@ function buildClientReviewState(reviewState, answers, companyProfile = null) {
       companyId: companyProfile?.id || reviewState.companyId || null,
       companyName: companyProfile?.name || '',
       reviewMode: reviewState.reviewMode || PROFESSIONAL_REVIEW_STANDARD,
-      periodLabel: buildPeriodLabel(reviewState.transactions),
+      periodLabel: buildPeriodLabelForReport(reviewState.transactions, reviewState.statementMetas),
       signOffState: 'awaiting_client',
       totalQuestions: questions.length,
       summary: questions.length > 0
@@ -6410,8 +6411,90 @@ function enumerateCoverageMonthKeys(startDate, endDate) {
   return monthKeys;
 }
 
-function buildStatementCoverageAudit(statementMetas = []) {
+const QUARTER_MONTH_RANGES = [
+  { quarter: 1, startMonth: 0, endMonth: 2 },
+  { quarter: 2, startMonth: 3, endMonth: 5 },
+  { quarter: 3, startMonth: 6, endMonth: 8 },
+  { quarter: 4, startMonth: 9, endMonth: 11 },
+];
+
+function detectReportingPeriod(statementMetas = []) {
   const normalizedStatementMetas = buildReportStatementMetas(statementMetas);
+  let overallStart = null;
+  let overallEnd = null;
+
+  for (const meta of normalizedStatementMetas) {
+    const { start, end } = getStatementDateRange(meta);
+    if (start && (!overallStart || start < overallStart)) overallStart = start;
+    if (end && (!overallEnd || end > overallEnd)) overallEnd = end;
+  }
+
+  if (!overallStart || !overallEnd) {
+    return {
+      kind: 'custom',
+      label: '',
+      startDate: null,
+      endDate: null,
+      expectedMonthKeys: [],
+      expectedMonthCount: 0,
+    };
+  }
+
+  const expectedMonthKeys = enumerateCoverageMonthKeys(overallStart, overallEnd);
+  const startYear = overallStart.getFullYear();
+  const endYear = overallEnd.getFullYear();
+  const startMonth = overallStart.getMonth();
+  const endMonth = overallEnd.getMonth();
+  const sameYear = startYear === endYear;
+
+  if (sameYear && expectedMonthKeys.length === 12 && startMonth === 0 && endMonth === 11) {
+    return {
+      kind: 'year',
+      label: `FY ${startYear}`,
+      startDate: overallStart,
+      endDate: overallEnd,
+      expectedMonthKeys,
+      expectedMonthCount: 12,
+    };
+  }
+
+  if (sameYear && expectedMonthKeys.length === 3) {
+    const match = QUARTER_MONTH_RANGES.find((q) => q.startMonth === startMonth && q.endMonth === endMonth);
+    if (match) {
+      return {
+        kind: 'quarter',
+        label: `Q${match.quarter} ${startYear}`,
+        startDate: overallStart,
+        endDate: overallEnd,
+        expectedMonthKeys,
+        expectedMonthCount: 3,
+      };
+    }
+  }
+
+  return {
+    kind: 'custom',
+    label: '',
+    startDate: overallStart,
+    endDate: overallEnd,
+    expectedMonthKeys,
+    expectedMonthCount: expectedMonthKeys.length,
+  };
+}
+
+function buildPeriodLabelForReport(transactions, statementMetas = []) {
+  const reportingPeriod = detectReportingPeriod(statementMetas);
+  if (reportingPeriod.kind !== 'custom' && reportingPeriod.label) {
+    return reportingPeriod.label;
+  }
+  return buildPeriodLabel(transactions);
+}
+
+function buildStatementCoverageAudit(statementMetas = [], reportingPeriod = null) {
+  const normalizedStatementMetas = buildReportStatementMetas(statementMetas);
+  const knownReportingPeriod = reportingPeriod && (reportingPeriod.kind === 'quarter' || reportingPeriod.kind === 'year')
+    ? reportingPeriod
+    : null;
   const accountCoverageMap = new Map();
   const coveredPackageMonths = new Set();
   let statementsMissingPeriodData = 0;
@@ -6520,18 +6603,29 @@ function buildStatementCoverageAudit(statementMetas = []) {
         };
       }
 
-      if (
-        overallExpectedMonths.length >= 6
-        && missingMonthsRelativeToPackage.length >= 2
-        && coveredMonths.length > 0
-        && coveredMonths.length < overallExpectedMonths.length
-      ) {
+      const periodKnown = knownReportingPeriod && (knownReportingPeriod.kind === 'quarter' || knownReportingPeriod.kind === 'year');
+      const partialPackageThresholdMet = periodKnown
+        ? (missingMonthsRelativeToPackage.length >= 1
+          && coveredMonths.length > 0
+          && coveredMonths.length < overallExpectedMonths.length)
+        : (overallExpectedMonths.length >= 6
+          && missingMonthsRelativeToPackage.length >= 2
+          && coveredMonths.length > 0
+          && coveredMonths.length < overallExpectedMonths.length);
+
+      if (partialPackageThresholdMet) {
+        const badge = periodKnown
+          ? (knownReportingPeriod.kind === 'quarter' ? `Partial ${knownReportingPeriod.label}` : 'Possible partial year')
+          : 'Possible partial year';
+        const summarySuffix = periodKnown
+          ? ` This run looks like a ${knownReportingPeriod.label} P&L (${knownReportingPeriod.expectedMonthCount} expected month(s)).`
+          : '';
         return {
           ...baseSignal,
           title: `${accountCoverage.label} only covers part of the uploaded package`,
           severity: 'notice',
-          badge: 'Possible partial year',
-          summary: `This source account has ${coveredMonths.length.toLocaleString()} covered calendar month(s) inside an overall package span of ${overallExpectedMonths.length.toLocaleString()} month(s).`,
+          badge,
+          summary: `This source account has ${coveredMonths.length.toLocaleString()} covered calendar month(s) inside an overall package span of ${overallExpectedMonths.length.toLocaleString()} month(s).${summarySuffix}`,
           detail: `Account coverage: ${coverageLabel || summarizeCoverageMonths(coveredMonths)}. Overall uploaded package: ${overallCoverageLabel}. Missing relative month(s): ${summarizeCoverageMonths(missingMonthsRelativeToPackage)}. If this account existed outside that range, the P&L may be partial because of missing files rather than categorization alone.`,
           chips: [
             `${accountCoverage.statements.length.toLocaleString()} statement(s)`,
@@ -7001,7 +7095,8 @@ function buildProfessionalAudit(
     verifierAutoAppliedCount: 0,
   };
   const normalizedStatementMetas = buildReportStatementMetas(statementMetas);
-  const coverageAudit = buildStatementCoverageAudit(normalizedStatementMetas);
+  const reportingPeriod = detectReportingPeriod(normalizedStatementMetas);
+  const coverageAudit = buildStatementCoverageAudit(normalizedStatementMetas, reportingPeriod);
   const statementsWithBalances = normalizedStatementMetas.filter((meta) => meta.openingBalance != null || meta.closingBalance != null).length;
   const sourceAccountsDetected = new Set(
     normalizedStatementMetas
@@ -7231,9 +7326,13 @@ function summarizeProfessionalTransactions(
   );
   const quickReports = buildProfessionalQuickReports(ledgerEntries, sourceLedgerEntries);
 
+  const reportingPeriod = detectReportingPeriod(normalizedStatementMetas);
   return {
     mode: PROFESSIONAL_MODE,
-    periodLabel: buildPeriodLabel(classifiedTransactions),
+    periodLabel: (reportingPeriod.kind !== 'custom' && reportingPeriod.label)
+      ? reportingPeriod.label
+      : buildPeriodLabel(classifiedTransactions),
+    reportingPeriod,
     transactionCount: classifiedTransactions.length,
     includedTransactionCount: classifiedTransactions.length - excludedTransactions.length,
     excludedCount: excludedTransactions.length,
