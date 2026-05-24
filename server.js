@@ -1724,18 +1724,22 @@ function buildReviewBucketInfo(signalType, tx, extra = null) {
     return buildAdjustmentFingerprint(tx.description);
   }
 
-  // Phase 8: personal candidates bucket by (category, canonical counterparty)
-  // so all e.g. NEWREZ payments collapse into one cluster, but a different
-  // mortgage servicer asks again. The category is captured in the bucket key
-  // so the same company can answer differently for, say, mortgage servicer vs
-  // life insurance to individual.
+  // Phase 8: personal candidates bucket by (category, brand stem) so all
+  // memo-suffix and branch-name variants of the same vendor collapse to one
+  // cluster (and one review question) per company. The brand stem comes from
+  // the detection result's category-specific brandOf() so e.g. "COMENITY PAY
+  // II DES WEB PYMT" and "COMENITY PAY VI WEB PYMT INDN" map to the same
+  // "Comenity" bucket, while "MAZDA FINANCIAL" stays separate from "CAPITAL
+  // ONE" within the personal_auto_loan category.
   if (signalType === 'personal_candidate_review') {
     const category = normalizeWhitespace(extra?.category) || 'unknown';
-    const counterparty = canonicalizeCounterpartyName('', tx.description) || normalizeDescription(tx.description);
-    const counterpartyKey = normalizeFingerprintSource(counterparty) || normalizeFingerprintSource(tx.description);
+    const brand = normalizeWhitespace(extra?.brand);
+    const fallbackCounterparty = canonicalizeCounterpartyName('', tx.description) || normalizeDescription(tx.description);
+    const label = brand || fallbackCounterparty;
+    const keyStem = normalizeFingerprintSource(label) || normalizeFingerprintSource(tx.description);
     return {
-      key: `PERSONAL::${category.toUpperCase()}::${counterpartyKey}`,
-      label: counterparty,
+      key: `PERSONAL::${category.toUpperCase()}::${keyStem}`,
+      label,
     };
   }
 
@@ -1801,7 +1805,10 @@ function buildPersistedReviewRuleMatch(questionType, tx) {
   if (questionType === 'personal_candidate_review') {
     const detection = detectPersonalCandidateCategory(tx);
     if (!detection) return null;
-    const bucketInfo = buildReviewBucketInfo('personal_candidate_review', tx, { category: detection.category });
+    const bucketInfo = buildReviewBucketInfo('personal_candidate_review', tx, {
+      category: detection.category,
+      brand: detection.brand,
+    });
     return bucketInfo.key
       ? {
         ruleType: 'personal_candidate_cluster',
@@ -3198,6 +3205,10 @@ function isKnownAutoFinancingDescription(description = '') {
 // The detector NEVER declares a transaction personal. It only proposes a
 // category match. Whether the category is personal "for this company" is a
 // per-company decision persisted via the existing review-rule store.
+// Brand extractors collapse memo-suffix and branch-name variants onto a
+// single canonical vendor stem within each category, so e.g. "COMENITY PAY
+// II DES WEB PYMT", "COMENITY PAY VI WEB PYMT INDN", "COMENITY PAY JT DES
+// WEB PYMT" all share one bucket key (and one review question) per company.
 const PERSONAL_CANDIDATE_PATTERNS = [
   {
     category: 'mortgage_servicer',
@@ -3207,6 +3218,9 @@ const PERSONAL_CANDIDATE_PATTERNS = [
     explain: (upper) => `Memo matches a residential mortgage servicer pattern (${
       (upper.match(/NEWREZ|SHELLPOIN|MR COOPER|ROCKET MORTGAGE|WELLS FARGO HOME|CHASE MORTGAGE|PENNYMAC|LOANDEPOT/) || ['unknown'])[0]
     }).`,
+    // Collapse all monthly mortgage payments to a single cluster — companies
+    // almost always have one mortgage servicer, so the brand stem is constant.
+    brandOf: () => 'Mortgage Servicer',
     typeFilter: 'deduction',
   },
   {
@@ -3217,6 +3231,12 @@ const PERSONAL_CANDIDATE_PATTERNS = [
     explain: (upper) => `Memo matches a consumer-brand credit-card payment (${
       (upper.match(/MACYS|NORDSTROM|BARCLAYCARD|COMENITY|TARGET CARD|JCPENNY|SAMS CLUB|TJX|MERRICK BANK|CREDIT ONE|BREADPAY|SYNCB|SYNCHRONY/) || ['unknown'])[0]
     }).`,
+    // Strip DES/WEB/PMT/PYMT/INDN/Roman-numeral suffixes so e.g. all Comenity
+    // family-of-cards variants collapse to a single "Comenity" cluster.
+    brandOf: (upper) => {
+      const m = upper.match(/MACYS|NORDSTROM|BARCLAYCARD|COMENITY|TARGET CARD|JCPENNY|SAMS CLUB|TJX|MERRICK BANK|CREDIT ONE|BREADPAY|SYNCB|SYNCHRONY/);
+      return m ? `${m[0]} (Consumer Card)` : 'Consumer Credit Card';
+    },
     typeFilter: 'deduction',
   },
   {
@@ -3228,6 +3248,17 @@ const PERSONAL_CANDIDATE_PATTERNS = [
       || (/\bCAPITAL ONE\b/.test(upper) && /\b(MOBILE PMT|ONLINE PMT)\b/.test(upper))
     ),
     explain: () => 'Memo matches a consumer auto-loan servicer pattern.',
+    brandOf: (upper) => {
+      if (/\bMAZDA\b/.test(upper)) return 'Mazda Financial';
+      if (/\bALLY\b/.test(upper)) return 'Ally Auto';
+      if (/\bNISSAN\b/.test(upper)) return 'Nissan Motor Acceptance';
+      if (/\bHONDA\b/.test(upper)) return 'Honda Financial';
+      if (/\bTOYOTA\b/.test(upper)) return 'Toyota Financial';
+      if (/\bGM FINANCIAL\b/.test(upper)) return 'GM Financial';
+      if (/\bFORD CREDIT\b/.test(upper)) return 'Ford Credit';
+      if (/\bCAPITAL ONE\b/.test(upper)) return 'Capital One Auto';
+      return 'Consumer Auto Loan';
+    },
     typeFilter: 'deduction',
   },
   {
@@ -3236,6 +3267,7 @@ const PERSONAL_CANDIDATE_PATTERNS = [
     confidence: 0.85,
     test: (upper) => /\bNEW YORK LIFE\b|\bNYLIFE OF ARIZON\b|\bPRIMERICA\b/.test(upper) && /\bINS\.? PREM\.?\b|\bINS PREM\b/.test(upper),
     explain: () => 'Memo matches a life-insurance premium to an individual policy.',
+    brandOf: () => 'Individual Life Insurance',
     typeFilter: 'deduction',
   },
   {
@@ -3247,6 +3279,12 @@ const PERSONAL_CANDIDATE_PATTERNS = [
     explain: (upper) => `Zelle memo names a family relationship (${
       (upper.match(/HIJA|HIJO|MAMA|PAPA|ESPOSA|MARIDO|HERMANA|HERMANO|TIA|TIO|ABUELA|ABUELO|MOM|DAD|SON|DAUGHTER|WIFE|HUSBAND|BROTHER|SISTER|SPOUSE/) || ['unknown'])[0]
     }).`,
+    brandOf: (upper) => {
+      const m = upper.match(/HIJA|HIJO|MAMA|PAPA|ESPOSA|MARIDO|HERMANA|HERMANO|TIA|TIO|ABUELA|ABUELO|MOM|DAD|SON|DAUGHTER|WIFE|HUSBAND|BROTHER|SISTER|SPOUSE/);
+      if (!m) return 'Family Zelle';
+      const tag = m[0];
+      return `Family Member (${tag.charAt(0) + tag.slice(1).toLowerCase()})`;
+    },
   },
   {
     category: 'atm_cash_withdrawal',
@@ -3254,6 +3292,9 @@ const PERSONAL_CANDIDATE_PATTERNS = [
     confidence: 0.8,
     test: (upper) => /\bATM\b.*\bWITHDRWL\b|\bATM WITHDRAWAL\b|\bBKOFAMERICA ATM\b.*WITHDR/.test(upper),
     explain: () => 'ATM cash withdrawal — destination cannot be verified from the statement alone.',
+    // Branch location is not relevant to the personal/business decision —
+    // collapse all ATM withdrawals into a single cluster per company.
+    brandOf: () => 'ATM Cash Withdrawal',
     typeFilter: 'deduction',
   },
   {
@@ -3264,6 +3305,19 @@ const PERSONAL_CANDIDATE_PATTERNS = [
     explain: (upper) => `POS purchase at a consumer lifestyle merchant (${
       (upper.match(/LOUIS VUITTON|TORY BURCH|ZARA|JASMINE NAILS|TENDENCIAS|JET FRESH|BATH AND BODY|BATHANDBODY|WAYOFWADE|MARSHALLS|CALIPSO/) || ['unknown'])[0]
     }).`,
+    brandOf: (upper) => {
+      if (/LOUIS VUITTON/.test(upper)) return 'Louis Vuitton';
+      if (/TORY BURCH/.test(upper)) return 'Tory Burch';
+      if (/ZARA/.test(upper)) return 'Zara';
+      if (/JASMINE NAILS/.test(upper)) return 'Jasmine Nails';
+      if (/TENDENCIAS/.test(upper)) return 'Tendencias Hair';
+      if (/JET FRESH/.test(upper)) return 'Jet Fresh Flower';
+      if (/BATH AND BODY|BATHANDBODY/.test(upper)) return 'Bath & Body Works';
+      if (/WAYOFWADE/.test(upper)) return 'Way Of Wade';
+      if (/MARSHALLS/.test(upper)) return 'Marshalls';
+      if (/CALIPSO/.test(upper)) return 'Calipso Shoes';
+      return 'Lifestyle Merchant';
+    },
     typeFilter: 'deduction',
   },
   {
@@ -3274,6 +3328,20 @@ const PERSONAL_CANDIDATE_PATTERNS = [
     explain: (upper) => `Memo matches a consumer subscription (${
       (upper.match(/NETFLIX|CRUNCH FIT|APPLE\.COM|OPENAI|MYMEALTIME|COOKIDOO|AMAZON PRIME|SPOTIFY|HULU|DISNEY|HBO/) || ['unknown'])[0]
     }).`,
+    brandOf: (upper) => {
+      if (/NETFLIX/.test(upper)) return 'Netflix';
+      if (/CRUNCH FIT/.test(upper)) return 'Crunch Fitness';
+      if (/APPLE\.COM/.test(upper)) return 'Apple.com';
+      if (/OPENAI/.test(upper)) return 'OpenAI / ChatGPT';
+      if (/MYMEALTIME/.test(upper)) return 'MyMealtime';
+      if (/COOKIDOO/.test(upper)) return 'Cookidoo / Vorwerk';
+      if (/AMAZON PRIME/.test(upper)) return 'Amazon Prime';
+      if (/SPOTIFY/.test(upper)) return 'Spotify';
+      if (/HULU/.test(upper)) return 'Hulu';
+      if (/DISNEY/.test(upper)) return 'Disney+';
+      if (/HBO/.test(upper)) return 'HBO Max';
+      return 'Consumer Subscription';
+    },
     typeFilter: 'deduction',
   },
 ];
@@ -3302,9 +3370,14 @@ function detectPersonalCandidateCategory(tx) {
 
   if (!bestMatch) return null;
 
+  const brand = typeof bestMatch.brandOf === 'function'
+    ? (bestMatch.brandOf(upper) || bestMatch.label || bestMatch.category)
+    : (bestMatch.label || bestMatch.category);
+
   return {
     category: bestMatch.category,
     label: bestMatch.label,
+    brand,
     confidence: bestConfidence,
     reasons,
   };
@@ -3395,7 +3468,15 @@ function isTravelExpenseDescription(description = '') {
 }
 
 function isAutoExpenseDescription(description = '') {
-  return /HERTZ|AVIS|ENTERPRISE|RENT-A-CAR|FUEL|GAS\b|SHELL|CHEVRON|EXXON|MARATHON|PARK|PARKING|PRKING|VALET|CAR WASH|FLPARKING|PARKRECEIPTS|PARK RECEIPTS|PY \*AVENTURA MALL VALET|ERACTOLL/i.test(description);
+  // Mortgage servicers must short-circuit here — NEWREZ-SHELLPOINT contains
+  // SHELL and was previously misrouted into Auto Expense / Fuel, hiding
+  // ~$7.5K of mortgage in the P&L.
+  if (/\bNEWREZ\b|\bSHELLPOIN(?:T)?\b|\bMR COOPER\b|\bROCKET MORTGAGE\b|\bWELLS FARGO HOME\b|\bCHASE MORTGAGE\b|\bPENNYMAC\b|\bLOANDEPOT\b/i.test(description)) {
+    return false;
+  }
+  return /HERTZ|AVIS|ENTERPRISE|RENT-A-CAR|FUEL|GAS\b|\bSHELL OIL\b|\bSHELL GAS\b|\bSHELL\s+\d/i.test(description)
+    || /CHEVRON|EXXON|MARATHON OIL|MARATHON PETRO|MOBIL\b|\bBP\b/i.test(description)
+    || /\bPARK\b|PARKING|PRKING|VALET|CAR WASH|FLPARKING|PARKRECEIPTS|PARK RECEIPTS|PY \*AVENTURA MALL VALET|ERACTOLL/i.test(description);
 }
 
 function isKnownSubcontractorVendor(description = '') {
@@ -3782,7 +3863,9 @@ function refineProfitAndLossAccount(section, group, account, description) {
     if (/HERTZ|AVIS|ENTERPRISE|RENTAL/.test(upperDescription)) {
       return { section, group, account: 'Car Rental' };
     }
-    if (/FUEL|GAS|SHELL|CHEVRON|EXXON|MOBIL|BP\b/.test(upperDescription)) {
+    // Word-boundary the brand names so SHELLPOIN(T) (NEWREZ mortgage
+    // servicer) doesn't get refined into the Fuel account.
+    if (/\bFUEL\b|\bGAS\b|\bSHELL OIL\b|\bSHELL GAS\b|\bCHEVRON\b|\bEXXON\b|\bMOBIL\b|\bBP\b/.test(upperDescription)) {
       return { section, group, account: 'Fuel' };
     }
     if (/PARK|PARKING|TOOL|TOLL|VALET/.test(upperDescription)) {
@@ -4073,7 +4156,12 @@ function buildTransferReviewSignal(tx) {
 // company via the existing review-rule store. The optional companyProfile
 // argument lets the prompt wording adapt to the company's business type.
 function buildPersonalCandidateReviewSignal(tx, detection, companyProfile = null) {
-  const counterparty = canonicalizeCounterpartyName('', tx.description) || normalizeDescription(tx.description);
+  // Prefer the category-specific brand stem so the question header reads as
+  // "Mortgage Servicer" / "Comenity (Consumer Card)" instead of the raw memo
+  // suffix that confused users on the first M.E.M. run.
+  const counterparty = normalizeWhitespace(detection.brand)
+    || canonicalizeCounterpartyName('', tx.description)
+    || normalizeDescription(tx.description);
   const categoryLabel = detection.label || detection.category || 'personal-looking';
   const reasons = Array.isArray(detection.reasons) && detection.reasons.length > 0
     ? detection.reasons
@@ -4092,6 +4180,7 @@ function buildPersonalCandidateReviewSignal(tx, detection, companyProfile = null
     reasons,
     detectionCategory: detection.category,
     detectionCategoryLabel: categoryLabel,
+    detectionBrand: detection.brand,
     detectionConfidence: detection.confidence,
     businessTypeId: businessTypeEntry.id,
     businessTypeLabel: businessTypeEntry.label,
@@ -4267,28 +4356,39 @@ function getProfessionalReviewSignal(tx, companyProfile = null) {
     return null;
   }
 
+  // Phase 8: personal-candidate detection runs FIRST so consumer-card payments
+  // (Comenity, Macy's, Capital One, etc.) and personal-loan ACHs surface as
+  // owner-draw candidates instead of being swallowed by the generic transfer
+  // heuristic. The personal signal already exposes "Treat as internal
+  // transfer" as an option for users who disagree, so we don't lose anything
+  // by preferring the more specific branch. If the company has already
+  // answered for this (category + brand) bucket, savedRuleApplied
+  // short-circuits this whole function at the top.
+  //
+  // Important: we surface the question even when the extractor has already
+  // routed the tx into the Ignore section (e.g. Credit Card Payments, Owner
+  // Personal), *as long as it isn't already in Owner Draws*. Without this,
+  // pre-Ignore'd clusters never get a chance to be confirmed, so the
+  // per-company persistence never learns them and the model's judgment call
+  // has to be re-made every run. The only state we skip is when the
+  // canonical Owner Draws bucket is already in effect.
+  const personalDetection = detectPersonalCandidateCategory(tx);
+  const alreadyInOwnerDraws = tx.plSection === 'Ignore' && tx.plGroup === 'Owner Draws';
+  if (
+    personalDetection
+    && personalDetection.confidence >= 0.55
+    && !alreadyInOwnerDraws
+    && !forcedRuleApplied
+  ) {
+    return buildPersonalCandidateReviewSignal(tx, personalDetection, companyProfile);
+  }
+
   if (looksLikeTransferOrBalanceSheet(tx) && tx.plSection !== 'Ignore' && !forcedRuleApplied) {
     return buildTransferReviewSignal(tx);
   }
 
   if (tx.type === 'deposit' && isRefundLikeDescription(upperDescription) && tx.plSection !== 'Other Income' && tx.plSection !== 'Ignore') {
     return buildRefundReviewSignal(tx);
-  }
-
-  // Phase 8: personal-candidate detection fires after transfer/refund (those
-  // are deterministic and universal) and before category_conflict (which
-  // would otherwise force the tx into a real bucket and obscure the personal
-  // signal). If the company has already answered for this (category +
-  // counterparty) bucket, savedRuleApplied short-circuits this whole function
-  // at the top, so this branch only fires for unconfirmed clusters.
-  const personalDetection = detectPersonalCandidateCategory(tx);
-  if (
-    personalDetection
-    && personalDetection.confidence >= 0.55
-    && tx.plSection !== 'Ignore'
-    && !forcedRuleApplied
-  ) {
-    return buildPersonalCandidateReviewSignal(tx, personalDetection, companyProfile);
   }
 
   if (tx.type === 'deduction') {
@@ -5212,7 +5312,10 @@ function buildProfessionalReviewQuestions(transactions, reviewMode = PROFESSIONA
     const signal = getProfessionalReviewSignal(tx, companyProfile);
     if (!signal) return;
 
-    const bucketInfo = buildReviewBucketInfo(signal.type, tx);
+    const bucketExtras = signal.type === 'personal_candidate_review'
+      ? { category: signal.detectionCategory, brand: signal.detectionBrand }
+      : null;
+    const bucketInfo = buildReviewBucketInfo(signal.type, tx, bucketExtras);
     const bucketKey = `${signal.type}::${bucketInfo.key}`;
 
     if (!questionBuckets.has(bucketKey)) {
@@ -6158,7 +6261,18 @@ function canonicalizeCounterpartyName(name = '', description = '') {
   if (/AIRBNB|HOTEL|LODGE|MARRIOTT|HILTON|HYATT|BOOKING/.test(source)) return 'Lodging';
   if (/AMERICAN AIR|AIRFARE|AIRLINES|DELTA|UNITED|JETBLUE|SOUTHWEST|SPIRIT|AVIANCA/.test(source)) return 'Airfare';
   if (/HERTZ|AVIS|ENTERPRISE|RENT-A-CAR/.test(source)) return 'Car Rental';
-  if (/SHELL|CHEVRON|EXXON|MARATHON|FUEL|GAS\b/.test(source)) return 'Fuel';
+  // Mortgage servicers must canonicalize BEFORE the fuel matcher because
+  // "NEWREZ-SHELLPOIN" contains SHELL and was previously mislabeled "Fuel".
+  if (/\bNEWREZ\b|\bSHELLPOIN\b|\bMR COOPER\b|\bROCKET MORTGAGE\b|\bWELLS FARGO HOME\b|\bCHASE MORTGAGE\b|\bPENNYMAC\b|\bLOANDEPOT\b/.test(source)) {
+    return 'Mortgage Servicer';
+  }
+  // Tighten fuel matcher so it requires a fuel-context token (SHELL alone
+  // is too greedy — collides with SHELLPOIN, SHELLEY, etc).
+  if (/\b(SHELL OIL|SHELL GAS|CHEVRON|EXXON|MARATHON OIL|MARATHON PETRO)\b/.test(source)
+    || /\bFUEL\b/.test(source)
+    || /\bGAS STATION\b/.test(source)) {
+    return 'Fuel';
+  }
   return normalizedName || inferCounterpartyName(description);
 }
 
@@ -6993,7 +7107,12 @@ function buildPersonalExpenseClusters(classifiedTransactions) {
     const detection = detectPersonalCandidateCategory(tx);
     if (!detection || detection.confidence < 0.55) continue;
 
-    const counterpartyLabel = canonicalizeCounterpartyName('', tx.description) || normalizeDescription(tx.description);
+    // Match the bucket-key shape that buildReviewBucketInfo produces so the
+    // audit cluster groups (and labels) line up with the review-question
+    // groups and persisted-rule buckets.
+    const counterpartyLabel = normalizeWhitespace(detection.brand)
+      || canonicalizeCounterpartyName('', tx.description)
+      || normalizeDescription(tx.description);
     const counterpartyKey = normalizeFingerprintSource(counterpartyLabel) || normalizeFingerprintSource(tx.description);
     const key = `${detection.category}::${counterpartyKey}`;
 
