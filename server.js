@@ -48,9 +48,11 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
-const ANTHROPIC_TIMEOUT_MS = Number.parseInt(process.env.ANTHROPIC_TIMEOUT_MS || '120000', 10);
+const ANTHROPIC_TIMEOUT_MS = Number.parseInt(process.env.ANTHROPIC_TIMEOUT_MS || '600000', 10);
+const ANTHROPIC_STREAM_IDLE_MS = Number.parseInt(process.env.ANTHROPIC_STREAM_IDLE_MS || '90000', 10);
 const ANTHROPIC_VERIFIER_TIMEOUT_MS = Number.parseInt(process.env.ANTHROPIC_VERIFIER_TIMEOUT_MS || '60000', 10);
 const ANTHROPIC_VERIFIER_BATCH_SIZE = Math.max(1, Number.parseInt(process.env.ANTHROPIC_VERIFIER_BATCH_SIZE || '6', 10) || 6);
+const EXTRACTION_CONCURRENCY = Math.max(1, Number.parseInt(process.env.EXTRACTION_CONCURRENCY || '3', 10) || 3);
 const OPENAI_VERIFIER_MIN_CLUSTER_AMOUNT = Number.parseFloat(process.env.OPENAI_VERIFIER_MIN_CLUSTER_AMOUNT || '750');
 const OPENAI_VERIFIER_AUTO_APPLY_CONFIDENCE = Number.parseFloat(process.env.OPENAI_VERIFIER_AUTO_APPLY_CONFIDENCE || '0.88');
 // Phase 7.8: anything below this confidence is force-routed to Ask My
@@ -7872,51 +7874,62 @@ async function processJob(jobId, files, analysisMode, reviewMode = null, company
     let filesCompleted = 0;
     let report = null;
 
-    for (const [index, file] of files.entries()) {
-      job.currentFile = index + 1;
-      console.log(`  [Job ${jobId}] Started processing [${index + 1}/${files.length}]: ${file.originalname}`);
+    const queue = files.map((file, index) => ({ file, index }));
+    const workerCount = Math.min(EXTRACTION_CONCURRENCY, files.length);
+    console.log(`  [Job ${jobId}] Extracting ${files.length} file(s) with concurrency ${workerCount}.`);
 
-      try {
-        const extractedData = await extractStatementDataFromPDF(file.buffer, analysisMode, file.originalname);
-        const statementMeta = sanitizeStatementMetadata(
-          extractedData.statementMeta,
-          file.originalname,
-          extractedData.transactions,
-        );
-        const sourceAccountMeta = inferSourceAccountMeta(file.originalname, statementMeta);
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (queue.length > 0) {
+        const item = queue.shift();
+        if (!item) break;
+        const { file, index } = item;
+        job.currentFile = index + 1;
+        console.log(`  [Job ${jobId}] Started processing [${index + 1}/${files.length}]: ${file.originalname}`);
 
-        statementMetas.push(statementMeta);
-        allTransactions.push(...extractedData.transactions.map((transaction) => ({
-          ...transaction,
-          sourceFile: file.originalname,
-          sourceStatementMeta: statementMeta,
-        })));
-        job.statementMetas = buildReportStatementMetas(statementMetas);
-        successCount += 1;
-        job.filesProcessed.push({
-          filename: file.originalname,
-          status: 'success',
-          transactionCount: extractedData.transactions.length,
-          sourceAccount: sourceAccountMeta.label,
-          statementPeriod: [statementMeta.statementStartDate, statementMeta.statementEndDate].filter(Boolean).join(' - '),
-          openingBalance: statementMeta.openingBalance,
-          closingBalance: statementMeta.closingBalance,
-        });
-        console.log(`  [Job ${jobId}] Extracted ${extractedData.transactions.length} transactions from ${file.originalname}`);
-      } catch (err) {
-        errorCount += 1;
-        console.error(`  [Job ${jobId}] Failed to process ${file.originalname}:`, err.message);
-        job.filesProcessed.push({
-          filename: file.originalname,
-          status: 'error',
-          error: err.message,
-        });
-      } finally {
-        filesCompleted += 1;
-        job.progress = Math.round((filesCompleted / files.length) * 100);
-        job.updatedAt = new Date().toISOString();
+        try {
+          const extractedData = await extractStatementDataFromPDF(file.buffer, analysisMode, file.originalname);
+          const statementMeta = sanitizeStatementMetadata(
+            extractedData.statementMeta,
+            file.originalname,
+            extractedData.transactions,
+          );
+          const sourceAccountMeta = inferSourceAccountMeta(file.originalname, statementMeta);
+
+          statementMetas.push(statementMeta);
+          allTransactions.push(...extractedData.transactions.map((transaction) => ({
+            ...transaction,
+            sourceFile: file.originalname,
+            sourceStatementMeta: statementMeta,
+          })));
+          job.statementMetas = buildReportStatementMetas(statementMetas);
+          successCount += 1;
+          job.filesProcessed.push({
+            filename: file.originalname,
+            status: 'success',
+            transactionCount: extractedData.transactions.length,
+            sourceAccount: sourceAccountMeta.label,
+            statementPeriod: [statementMeta.statementStartDate, statementMeta.statementEndDate].filter(Boolean).join(' - '),
+            openingBalance: statementMeta.openingBalance,
+            closingBalance: statementMeta.closingBalance,
+          });
+          console.log(`  [Job ${jobId}] Extracted ${extractedData.transactions.length} transactions from ${file.originalname}`);
+        } catch (err) {
+          errorCount += 1;
+          console.error(`  [Job ${jobId}] Failed to process ${file.originalname}:`, err.message);
+          job.filesProcessed.push({
+            filename: file.originalname,
+            status: 'error',
+            error: err.message,
+          });
+        } finally {
+          filesCompleted += 1;
+          job.progress = Math.round((filesCompleted / files.length) * 100);
+          job.updatedAt = new Date().toISOString();
+        }
       }
-    }
+    });
+
+    await Promise.all(workers);
 
     job.successCount = successCount;
     job.errorCount = errorCount;
